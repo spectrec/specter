@@ -11,9 +11,16 @@ CFLAGS = -std=gnu99 \
 LDFLAGS = -lev -ggdb3
 
 sources = src/main.c \
-	  src/config.c
+	  src/sbuf.c \
+	  src/libev.c \
+	  src/config.c \
+	  src/specter.c
 
 program = specter
+
+ifeq (${ADDRESS_SANITIZE},1)
+CFLAGS += -fsanitize=address
+endif
 
 ifeq (${COV},1)
 CFLAGS += --coverage
@@ -36,6 +43,6 @@ ${program}: ${objects}
 
 
 clean:
-	@rm -f src/*.{d,o}
+	@rm -f src/*.{d,o} ${program}
 
 .PHONY: clean all
