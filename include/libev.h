@@ -18,6 +18,7 @@ typedef enum libev_ret (*libev_cb_t)(struct libev_conn *cn);
 struct libev_conn {
 	void *ctx;
 	struct ev_io w;
+	struct ev_cleanup gc;
 
 	libev_cb_t read_cb;
 	libev_cb_t write_cb;

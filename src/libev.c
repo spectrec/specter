@@ -14,7 +14,7 @@
 #include "config.h"
 #include "specter.h"
 
-#define LIBEV_CONN(_w) (struct libev_conn *)(((char *)_w) - offsetof(struct libev_conn, w));
+#define LIBEV_CONN(_w, _n) (struct libev_conn *)(((char *)_w) - offsetof(struct libev_conn, _n));
 
 static struct ev_loop *__loop;
 //static struct ev_io __node_watcher; // accept connections from nodes
@@ -29,6 +29,12 @@ static void libev_read_cb(EV_P_ ev_io *w, int revent);
 static void libev_write_cb(EV_P_ ev_io *w, int revent);
 //static void libev_accept_new_node_cb(EV_P_ ev_io *w, int revents);
 static void libev_accept_new_client_cb(EV_P_ ev_io *w, int revents);
+
+__attribute__((destructor))
+static void libev_cleanup(void)
+{
+	ev_loop_destroy(__loop);
+}
 
 static int libev_set_socket_nonblock(int fd)
 {
@@ -103,6 +109,7 @@ static void libev_cleanup_conn(struct libev_conn *lc)
 
 	(void)close(lc->w.fd);
 	ev_io_stop(__loop, &lc->w);
+	ev_cleanup_stop(__loop, &lc->gc);
 
 	lc->destroy_cb(lc);
 
@@ -123,7 +130,7 @@ static void libev_cb(EV_P_ ev_io *w, int revent)
 #define DEFAULT_READ_LEN 4096
 static void libev_read_cb(EV_P_ ev_io *w, int revent)
 {
-	struct libev_conn *lc = LIBEV_CONN(w);
+	struct libev_conn *lc = LIBEV_CONN(w, w);
 	bool new_data = false, close_connection = false;
 
 	(void)loop;
@@ -162,7 +169,7 @@ static void libev_read_cb(EV_P_ ev_io *w, int revent)
 
 static void libev_write_cb(EV_P_ ev_io *w, int revent)
 {
-	struct libev_conn *lc = LIBEV_CONN(w);
+	struct libev_conn *lc = LIBEV_CONN(w, w);
 
 	(void)loop;
 	(void)revent;
@@ -231,6 +238,15 @@ static void libev_accept_new_node_cb(EV_P_ ev_io *w, int revents)
 }
 */
 
+static void libev_cleanup_cb(EV_P_ ev_cleanup *gc)
+{
+	struct libev_conn *lc = LIBEV_CONN(gc, gc);
+
+	(void)loop;
+
+	libev_cleanup_conn(lc);
+}
+
 // XXX: `port' and `host' should have network byte order
 enum libev_ret libev_connect_to(struct libev_conn *cn, uint16_t port,
 				uint32_t host, libev_cb_t cb)
@@ -241,6 +257,9 @@ enum libev_ret libev_connect_to(struct libev_conn *cn, uint16_t port,
 	fd = socket(AF_INET, SOCK_STREAM, 0);
 	ev_io_init(&cn->w, libev_cb, fd, EV_READ | EV_WRITE);
 	ev_io_start(__loop, &cn->w);
+
+	ev_cleanup_init(&cn->gc, libev_cleanup_cb);
+	ev_cleanup_start(__loop, &cn->gc);
 
 	if (fd < 0) {
 		log_e("can't create socket: %s", strerror(errno));
@@ -305,6 +324,9 @@ static void libev_accept_new_client_cb(EV_P_ ev_io *w, int revents)
 
 	ev_io_init(&cn->w, libev_cb, client_fd, EV_READ | EV_WRITE);
 	ev_io_start(__loop, &cn->w);
+
+	ev_cleanup_init(&cn->gc, libev_cleanup_cb);
+	ev_cleanup_start(__loop, &cn->gc);
 
 	specter_new_client_conn_init(cn);
 
