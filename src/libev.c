@@ -187,14 +187,19 @@ static void libev_write_cb(EV_P_ ev_io *w, int revent)
 			log_w("nothing was sent by [%d], try again", lc->w.fd);
 
 		sbuf_shrink(&lc->wbuf, ret);
-		// TODO: disable it here if buffer is empty
+	}
+
+	if (lc->wbuf.size == 0) {
+		ev_io_stop(EV_A_ w);
+		ev_io_set(w, w->fd, EV_READ);
+		ev_io_start(EV_A_ w);
 	}
 
 	if (lc->write_cb != NULL && lc->write_cb(lc) != LIBEV_RET_OK)
 		libev_cleanup_conn(lc);
 }
 
-static void libev_signal_handler(EV_P_ ev_signal *w, int revents)
+static void libev_signal_cb(EV_P_ ev_signal *w, int revents)
 {
 	(void)revents;
 
@@ -215,29 +220,6 @@ static void libev_signal_handler(EV_P_ ev_signal *w, int revents)
 	}
 }
 
-static void libev_init_signal_handlers()
-{
-	ev_signal_init(&__sigpipe_watcher, libev_signal_handler, SIGPIPE);
-	ev_signal_start(__loop, &__sigpipe_watcher);
-
-	ev_signal_init(&__sigint_watcher, libev_signal_handler, SIGINT);
-	ev_signal_start(__loop, &__sigint_watcher);
-
-	ev_signal_init(&__sigterm_watcher, libev_signal_handler, SIGTERM);
-	ev_signal_start(__loop, &__sigterm_watcher);
-
-	ev_signal_init(&__sigquit_watcher, libev_signal_handler, SIGQUIT);
-	ev_signal_start(__loop, &__sigquit_watcher);
-}
-
-/*
-static void libev_accept_new_node_cb(EV_P_ ev_io *w, int revents)
-{
-	(void)w;
-	(void)revents;
-}
-*/
-
 static void libev_cleanup_cb(EV_P_ ev_cleanup *gc)
 {
 	struct libev_conn *lc = LIBEV_CONN(gc, gc);
@@ -246,6 +228,16 @@ static void libev_cleanup_cb(EV_P_ ev_cleanup *gc)
 
 	libev_cleanup_conn(lc);
 }
+
+
+
+/*
+static void libev_accept_new_node_cb(EV_P_ ev_io *w, int revents)
+{
+	(void)w;
+	(void)revents;
+}
+*/
 
 // XXX: `port' and `host' should have network byte order
 enum libev_ret libev_connect_to(struct libev_conn *cn, uint16_t port,
@@ -333,6 +325,21 @@ static void libev_accept_new_client_cb(EV_P_ ev_io *w, int revents)
 	log_d("accept new client [%d]", client_fd);
 }
 
+static void libev_init_signal_handlers()
+{
+	ev_signal_init(&__sigpipe_watcher, libev_signal_cb, SIGPIPE);
+	ev_signal_start(__loop, &__sigpipe_watcher);
+
+	ev_signal_init(&__sigint_watcher, libev_signal_cb, SIGINT);
+	ev_signal_start(__loop, &__sigint_watcher);
+
+	ev_signal_init(&__sigterm_watcher, libev_signal_cb, SIGTERM);
+	ev_signal_start(__loop, &__sigterm_watcher);
+
+	ev_signal_init(&__sigquit_watcher, libev_signal_cb, SIGQUIT);
+	ev_signal_start(__loop, &__sigquit_watcher);
+}
+
 int libev_initialize()
 {
 	struct config *config = config_get();
@@ -367,5 +374,12 @@ void libev_run()
 void libev_send(struct libev_conn *cn, const void *data, size_t size)
 {
 	sbuf_append(&cn->wbuf, data, size);
-	// TODO: enable write event here
+
+	// Try to send immidiatly
+	libev_write_cb(__loop, &cn->w, EV_WRITE);
+	if (cn->wbuf.size != 0 && (cn->w.events & EV_WRITE) == 0) {
+		ev_io_stop(__loop, &cn->w);
+		ev_io_set(&cn->w, cn->w.fd, EV_WRITE | EV_READ);
+		ev_io_start(__loop, &cn->w);
+	}
 }
