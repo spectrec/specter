@@ -34,5 +34,6 @@ int libev_initialize();
 void libev_send(struct libev_conn *cn, const void *data, size_t size);
 enum libev_ret libev_connect_to(struct libev_conn *cn, uint16_t port,
 				uint32_t host, libev_cb_t cb);
+void libev_cleanup_conn(struct libev_conn *lc);
 
 #endif

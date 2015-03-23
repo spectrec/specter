@@ -189,6 +189,8 @@ static enum libev_ret specter_conn_destroy(struct libev_conn *cn)
 	if (ctx->host != NULL) {
 		struct specter_context *nested_ctx = ctx->host->ctx;
 		nested_ctx->host = NULL;
+
+		libev_cleanup_conn(ctx->host);
 	}
 
 	free(cn->ctx);
