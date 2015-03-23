@@ -90,41 +90,6 @@ static int libev_bind_listen_tcp_socket(uint16_t port, uint32_t addr)
 	return fd;
 }
 
-struct libev_conn *libev_create_conn(void)
-{
-	struct libev_conn *cn;
-
-	cn = calloc(1, sizeof(*cn));
-	assert(cn != 0);
-
-	sbuf_init(&cn->rbuf);
-	sbuf_init(&cn->wbuf);
-
-	return cn;
-}
-
-void libev_cleanup_conn(struct libev_conn *lc)
-{
-	lc->read_cb = NULL;
-	lc->write_cb = NULL;
-
-	(void)close(lc->w.fd);
-	log_d("conn [%d] closed", lc->w.fd);
-
-	ev_io_stop(__loop, &lc->w);
-	ev_cleanup_stop(__loop, &lc->gc);
-
-	if (lc->ctx != NULL) {
-		assert(lc->destroy_cb != NULL);
-		lc->destroy_cb(lc);
-	}
-
-	sbuf_delete(&lc->rbuf);
-	sbuf_delete(&lc->wbuf);
-
-	free(lc);
-}
-
 #define DEFAULT_READ_LEN 4096
 static void libev_read_cb(EV_P_ ev_io *w, int revent)
 {
@@ -234,6 +199,44 @@ static void libev_cleanup_cb(EV_P_ ev_cleanup *gc)
 	libev_cleanup_conn(lc);
 }
 
+struct libev_conn *libev_create_conn(void)
+{
+	struct libev_conn *cn;
+
+	cn = calloc(1, sizeof(*cn));
+	assert(cn != NULL);
+
+	sbuf_init(&cn->rbuf);
+	sbuf_init(&cn->wbuf);
+
+	ev_cleanup_init(&cn->gc, libev_cleanup_cb);
+	ev_cleanup_start(__loop, &cn->gc);
+
+	return cn;
+}
+
+void libev_cleanup_conn(struct libev_conn *lc)
+{
+	lc->read_cb = NULL;
+	lc->write_cb = NULL;
+
+	(void)close(lc->w.fd);
+	log_d("conn [%d] closed", lc->w.fd);
+
+	ev_io_stop(__loop, &lc->w);
+	ev_cleanup_stop(__loop, &lc->gc);
+
+	if (lc->ctx != NULL) {
+		assert(lc->destroy_cb != NULL);
+		lc->destroy_cb(lc);
+	}
+
+	sbuf_delete(&lc->rbuf);
+	sbuf_delete(&lc->wbuf);
+
+	free(lc);
+}
+
 // XXX: `port' and `host' should have network byte order
 enum libev_ret libev_connect_to(struct libev_conn *cn, uint16_t port,
 				uint32_t host, libev_cb_t cb)
@@ -244,9 +247,6 @@ enum libev_ret libev_connect_to(struct libev_conn *cn, uint16_t port,
 	fd = socket(AF_INET, SOCK_STREAM, 0);
 	ev_io_init(&cn->w, libev_cb, fd, EV_READ | EV_WRITE);
 	ev_io_start(__loop, &cn->w);
-
-	ev_cleanup_init(&cn->gc, libev_cleanup_cb);
-	ev_cleanup_start(__loop, &cn->gc);
 
 	if (fd < 0) {
 		log_e("can't create socket: %s", strerror(errno));
@@ -273,7 +273,7 @@ enum libev_ret libev_connect_to(struct libev_conn *cn, uint16_t port,
 		if (errno == EINPROGRESS)
 			return LIBEV_RET_OK;
 
-		log_e("connect failed: %s", strerror(errno));
+		log_e("connect [%d] failed: %s", fd, strerror(errno));
 		libev_cleanup_conn(cn);
 
 		return LIBEV_RET_ERROR;
@@ -282,52 +282,59 @@ enum libev_ret libev_connect_to(struct libev_conn *cn, uint16_t port,
 	return LIBEV_RET_OK;
 }
 
-// TODO: implement it
-static void libev_accept_new_node_cb(EV_P_ ev_io *w, int revents)
-{
-	(void)w;
-	(void)loop;
-	(void)revents;
-}
-
-static void libev_accept_new_client_cb(EV_P_ ev_io *w, int revents)
+static struct libev_conn *libev_accept_new_conn(EV_P_ ev_io *w)
 {
 	int client_fd;
 	struct libev_conn *cn;
 	struct sockaddr_in sa;
 	socklen_t sa_len = sizeof(sa);
 
-	(void)loop;
-	(void)revents;
-
 	client_fd = accept(w->fd, (struct sockaddr *)&sa, &sa_len);
 	if (client_fd < 0) {
 		log_e("can't accept new client: %s", strerror(errno));
 
-		return;
+		return NULL;
 	}
 
 	if (libev_set_socket_nonblock(client_fd) != 0) {
 		(void)close(client_fd);
 
-		return;
+		return NULL;
 	}
 
-	cn = calloc(1, sizeof(*cn));
-	assert(cn != NULL);
-
-	sbuf_init(&cn->rbuf);
-	sbuf_init(&cn->wbuf);
-
+	cn = libev_create_conn();
 	ev_io_init(&cn->w, libev_cb, client_fd, EV_READ | EV_WRITE);
-	ev_io_start(__loop, &cn->w);
-
-	ev_cleanup_init(&cn->gc, libev_cleanup_cb);
-	ev_cleanup_start(__loop, &cn->gc);
-
-	specter_new_client_conn_init(cn);
+	ev_io_start(loop, &cn->w);
 
 	log_d("accept new client [%d]", client_fd);
+
+	return cn;
+}
+
+static void libev_accept_new_node_cb(EV_P_ ev_io *w, int revents)
+{
+	struct libev_conn *cn;
+
+	(void)revents;
+
+	cn = libev_accept_new_conn(EV_A_ w);
+	if (cn == NULL)
+		return;
+
+	specter_new_node_conn_init(cn);
+}
+
+static void libev_accept_new_client_cb(EV_P_ ev_io *w, int revents)
+{
+	struct libev_conn *cn;
+
+	(void)revents;
+
+	cn = libev_accept_new_conn(EV_A_ w);
+	if (cn == NULL)
+		return;
+
+	specter_new_client_conn_init(cn);
 }
 
 static void libev_init_signal_handlers()

@@ -200,6 +200,11 @@ static enum libev_ret specter_conn_destroy(struct libev_conn *cn)
 	return LIBEV_RET_OK;
 }
 
+void specter_new_node_conn_init(struct libev_conn *cn)
+{
+	(void)cn;
+}
+
 void specter_new_client_conn_init(struct libev_conn *cn)
 {
 	struct specter_context *ctx;
