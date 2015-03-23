@@ -17,18 +17,6 @@
 #define LIBEV_CONN(_w, _n) (struct libev_conn *)(((char *)_w) - offsetof(struct libev_conn, _n));
 
 static struct ev_loop *__loop;
-static struct ev_io __node_watcher; // accept connections from nodes
-static struct ev_io __client_watcher; // accept connections from clients
-
-static struct ev_signal __sigint_watcher;
-static struct ev_signal __sigterm_watcher;
-static struct ev_signal __sigquit_watcher;
-static struct ev_signal __sigpipe_watcher;
-
-static void libev_read_cb(EV_P_ ev_io *w, int revent);
-static void libev_write_cb(EV_P_ ev_io *w, int revent);
-static void libev_accept_new_node_cb(EV_P_ ev_io *w, int revents);
-static void libev_accept_new_client_cb(EV_P_ ev_io *w, int revents);
 
 __attribute__((destructor))
 static void libev_cleanup(void)
@@ -102,6 +90,19 @@ static int libev_bind_listen_tcp_socket(uint16_t port, uint32_t addr)
 	return fd;
 }
 
+struct libev_conn *libev_create_conn(void)
+{
+	struct libev_conn *cn;
+
+	cn = calloc(1, sizeof(*cn));
+	assert(cn != 0);
+
+	sbuf_init(&cn->rbuf);
+	sbuf_init(&cn->wbuf);
+
+	return cn;
+}
+
 void libev_cleanup_conn(struct libev_conn *lc)
 {
 	lc->read_cb = NULL;
@@ -113,20 +114,15 @@ void libev_cleanup_conn(struct libev_conn *lc)
 	ev_io_stop(__loop, &lc->w);
 	ev_cleanup_stop(__loop, &lc->gc);
 
-	lc->destroy_cb(lc);
+	if (lc->ctx != NULL) {
+		assert(lc->destroy_cb != NULL);
+		lc->destroy_cb(lc);
+	}
 
 	sbuf_delete(&lc->rbuf);
 	sbuf_delete(&lc->wbuf);
 
 	free(lc);
-}
-
-static void libev_cb(EV_P_ ev_io *w, int revent)
-{
-	if ((revent & EV_READ) != 0)
-		libev_read_cb(EV_A_ w, revent);
-	else if ((revent & EV_WRITE) != 0)
-		libev_write_cb(EV_A_ w, revent);
 }
 
 #define DEFAULT_READ_LEN 4096
@@ -200,6 +196,14 @@ static void libev_write_cb(EV_P_ ev_io *w, int revent)
 		libev_cleanup_conn(lc);
 }
 
+static void libev_cb(EV_P_ ev_io *w, int revent)
+{
+	if ((revent & EV_READ) != 0)
+		libev_read_cb(EV_A_ w, revent);
+	else if ((revent & EV_WRITE) != 0)
+		libev_write_cb(EV_A_ w, revent);
+}
+
 static void libev_signal_cb(EV_P_ ev_signal *w, int revents)
 {
 	(void)revents;
@@ -229,7 +233,6 @@ static void libev_cleanup_cb(EV_P_ ev_cleanup *gc)
 
 	libev_cleanup_conn(lc);
 }
-
 
 // XXX: `port' and `host' should have network byte order
 enum libev_ret libev_connect_to(struct libev_conn *cn, uint16_t port,
@@ -329,6 +332,11 @@ static void libev_accept_new_client_cb(EV_P_ ev_io *w, int revents)
 
 static void libev_init_signal_handlers()
 {
+	static struct ev_signal __sigint_watcher;
+	static struct ev_signal __sigterm_watcher;
+	static struct ev_signal __sigquit_watcher;
+	static struct ev_signal __sigpipe_watcher;
+
 	ev_signal_init(&__sigpipe_watcher, libev_signal_cb, SIGPIPE);
 	ev_signal_start(__loop, &__sigpipe_watcher);
 
@@ -344,6 +352,8 @@ static void libev_init_signal_handlers()
 
 int libev_initialize()
 {
+	static struct ev_io __client_watcher;
+	static struct ev_io __node_watcher;
 	struct config *config = config_get();
 	int fd;
 

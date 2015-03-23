@@ -121,13 +121,14 @@ static enum libev_ret specter_connect_to(struct libev_conn *cn,
 	struct specter_context *host_ctx;
 	struct libev_conn *host_cn;
 
-	host_cn = calloc(1, sizeof(*cn));
 	host_ctx = calloc(1, sizeof(struct specter_context));
-
-	host_cn->ctx = host_ctx;
-	host_cn->destroy_cb = specter_conn_destroy;
+	assert(host_ctx != NULL);
 	host_ctx->type = CONTEXT_FOR_HOST;
 	host_ctx->client = cn;
+
+	host_cn = libev_create_conn();
+	host_cn->ctx = host_ctx;
+	host_cn->destroy_cb = specter_conn_destroy;
 
 	assert(ctx->host == NULL);
 	assert(ctx->type == CONTEXT_FOR_CLIENT);
@@ -205,9 +206,9 @@ void specter_new_client_conn_init(struct libev_conn *cn)
 
 	ctx = calloc(1, sizeof(struct specter_context));
 	ctx->type = CONTEXT_FOR_CLIENT;
-	cn->ctx = ctx;
 
-	cn->destroy_cb = specter_conn_destroy;
-	cn->read_cb = specter_read_socks_req;
+	cn->ctx = ctx;
 	cn->write_cb = NULL;
+	cn->read_cb = specter_read_socks_req;
+	cn->destroy_cb = specter_conn_destroy;
 }
