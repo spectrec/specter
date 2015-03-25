@@ -18,6 +18,7 @@ typedef enum libev_ret (*libev_cb_t)(struct libev_conn *cn);
 struct libev_conn {
 	void *ctx;
 	struct ev_io w;
+	struct ev_timer t;
 	struct ev_cleanup gc;
 
 	libev_cb_t read_cb;
@@ -36,6 +37,6 @@ void libev_cleanup_conn(struct libev_conn *cn);
 
 void libev_send(struct libev_conn *cn, const void *data, size_t size);
 enum libev_ret libev_connect_to(struct libev_conn *cn, uint16_t port,
-				uint32_t host, libev_cb_t cb);
+				uint32_t host, libev_cb_t cb, float timeout);
 
 #endif

@@ -11,7 +11,7 @@ use AnyEvent::Handle;
 use Data::Dumper;
 use Scalar::Util qw(refaddr);
 
-my $__port = 7777;
+my $__port = 5432;
 my $cv = AnyEvent->condvar();
 
 sub CMD_PUT() { 1 }

@@ -136,6 +136,7 @@ static void libev_write_cb(EV_P_ ev_io *w, int revent)
 
 	(void)revent;
 
+	ev_timer_stop(__loop, &lc->t);
 	if (lc->wbuf.size != 0) {
 		ssize_t ret = send(w->fd, lc->wbuf.data, lc->wbuf.size, 0);
 		if (ret < 0) {
@@ -199,6 +200,16 @@ static void libev_cleanup_cb(EV_P_ ev_cleanup *gc)
 	libev_cleanup_conn(lc);
 }
 
+static void libev_timeout_cb(EV_P_ ev_timer *t)
+{
+	struct libev_conn *lc = LIBEV_CONN(t, t);
+
+	(void)loop;
+
+	log_e("[%d] connection failed: timed out", lc->w.fd);
+	libev_cleanup_conn(lc);
+}
+
 struct libev_conn *libev_create_conn(void)
 {
 	struct libev_conn *cn;
@@ -239,7 +250,7 @@ void libev_cleanup_conn(struct libev_conn *lc)
 
 // XXX: `port' and `host' should have network byte order
 enum libev_ret libev_connect_to(struct libev_conn *cn, uint16_t port,
-				uint32_t host, libev_cb_t cb)
+				uint32_t host, libev_cb_t cb, float timeout)
 {
 	int fd;
 	struct sockaddr_in sa;
@@ -247,6 +258,9 @@ enum libev_ret libev_connect_to(struct libev_conn *cn, uint16_t port,
 	fd = socket(AF_INET, SOCK_STREAM, 0);
 	ev_io_init(&cn->w, libev_cb, fd, EV_READ | EV_WRITE);
 	ev_io_start(__loop, &cn->w);
+
+	ev_timer_init(&cn->t, libev_timeout_cb, timeout, 0.);
+	ev_timer_start(__loop, &cn->t);
 
 	if (fd < 0) {
 		log_e("can't create socket: %s", strerror(errno));
@@ -357,7 +371,7 @@ static void libev_init_signal_handlers()
 	ev_signal_start(__loop, &__sigquit_watcher);
 }
 
-int libev_initialize()
+static enum libev_ret libev_connected_to_master(struct libev_conn *cn)
 {
 	static struct ev_io __client_watcher;
 	static struct ev_io __node_watcher;
@@ -368,19 +382,42 @@ int libev_initialize()
 
 	fd = libev_bind_listen_tcp_socket(config->listen_port, config->listen_addr);
 	if (fd == -1)
-		return -1;
+		return LIBEV_RET_ERROR;
 
 	ev_io_init(&__client_watcher, libev_accept_new_client_cb, fd, EV_READ);
 	ev_io_start(__loop, &__client_watcher);
 
 	fd = libev_bind_listen_tcp_socket(config->listen_node_port, config->listen_node_addr);
 	if (fd == -1)
-		return -1;
+		return LIBEV_RET_ERROR;
 
 	ev_io_init(&__node_watcher, libev_accept_new_node_cb, fd, EV_READ);
 	ev_io_start(__loop, &__node_watcher);
 
+	// TODO: send port and host
+	(void)cn;
+	log_d("success connected to designator");
+
+	return LIBEV_RET_OK;
+}
+
+int libev_initialize()
+{
+	uint16_t port;
+	uint32_t host;
+	float timeout;
+	struct libev_conn *cn;
+	struct config *config = config_get();
+
+	__loop = EV_DEFAULT;
 	libev_init_signal_handlers();
+
+	cn = libev_create_conn();
+	port = htons(config->designator_port);
+	host = htonl(config->designator_addr);
+	timeout = config->designator_connect_timeout;
+	if (libev_connect_to(cn, port, host, libev_connected_to_master, timeout) != LIBEV_RET_OK)
+		return -1;
 
 	return 0;
 }

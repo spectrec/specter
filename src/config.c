@@ -34,6 +34,21 @@ static bool __config_initialized;
 	val;								\
 })
 
+#define convert_str_to_float(_str) ({					\
+	char *endptr = NULL;						\
+	float val;							\
+									\
+	val = strtof(_str, &endptr);					\
+	if (*endptr != '\0') {						\
+		fprintf(stderr, "can't convert `%s' to digit, "		\
+				"error at `%s'", _str, endptr);		\
+									\
+		return -1;						\
+	}								\
+									\
+	val;								\
+})
+
 __attribute__((destructor))
 static void config_cleanup(void)
 {
@@ -70,6 +85,10 @@ static int config_store_value(const char *key, const char *value)
 		__config.listen_node_port = (uint16_t)convert_str_to_long(value);
 	} else if (strcmp(key, "designator_port") == 0) {
 		__config.designator_port = (uint16_t)convert_str_to_long(value);
+	} else if (strcmp(key, "node_connect_timeout") == 0) {
+		__config.node_connect_timeout = (float)convert_str_to_float(value);
+	} else if (strcmp(key, "designator_connect_timeout") == 0) {
+		__config.designator_connect_timeout = (float)convert_str_to_float(value);
 	} else {
 		fprintf(stderr, "unknown key `%s'", key);
 

@@ -17,6 +17,9 @@ struct config {
 
 	char *public_key;
 	char *private_key;
+
+	float node_connect_timeout;
+	float designator_connect_timeout;
 };
 
 struct config *config_get(void);

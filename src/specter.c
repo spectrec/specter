@@ -6,6 +6,7 @@
 #include "log.h"
 #include "pack.h"
 #include "libev.h"
+#include "config.h"
 #include "specter.h"
 
 enum specter_context_for {
@@ -120,6 +121,8 @@ static enum libev_ret specter_connect_to(struct libev_conn *cn,
 	struct specter_context *ctx = cn->ctx;
 	struct specter_context *host_ctx;
 	struct libev_conn *host_cn;
+	struct config *config;
+	float timeout;
 
 	host_ctx = calloc(1, sizeof(struct specter_context));
 	assert(host_ctx != NULL);
@@ -134,7 +137,9 @@ static enum libev_ret specter_connect_to(struct libev_conn *cn,
 	assert(ctx->type == CONTEXT_FOR_CLIENT);
 	ctx->host = host_cn;
 
-	if (libev_connect_to(host_cn, port, host, specter_connected) != LIBEV_RET_OK)
+	config = config_get();
+	timeout = config->node_connect_timeout;
+	if (libev_connect_to(host_cn, port, host, specter_connected, timeout) != LIBEV_RET_OK)
 		return LIBEV_RET_ERROR;
 
 	return LIBEV_RET_OK;
