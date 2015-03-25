@@ -71,10 +71,13 @@ static int config_store_value(const char *key, const char *value)
 
 	if (strcmp(key, "listen_addr") == 0) {
 		convert_str_to_addr(value, &__config.listen_addr);
+		__config.listen_addr = ntohl(__config.listen_addr);
 	} else if (strcmp(key, "listen_node_addr") == 0) {
 		convert_str_to_addr(value, &__config.listen_node_addr);
+		__config.listen_node_addr = ntohl(__config.listen_node_addr);
 	} else if (strcmp(key, "designator_addr") == 0) {
 		convert_str_to_addr(value, &__config.designator_addr);
+		__config.designator_addr = ntohl(__config.designator_addr);
 	} else if (strcmp(key, "public_key") == 0) {
 		__config.public_key = strdup(value);
 	} else if (strcmp(key, "private_key") == 0) {
