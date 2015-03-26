@@ -8,6 +8,12 @@
 #include "libev.h"
 #include "config.h"
 #include "specter.h"
+#include <arpa/inet.h>
+
+enum designator_command {
+	DESIGNATOR_COMMAND_PUT = 1,
+	DESIGNATOR_COMMAND_GET = 2,
+};
 
 enum specter_context_for {
 	CONTEXT_FOR_CLIENT = 1,
@@ -24,6 +30,13 @@ struct specter_context {
 };
 
 static enum libev_ret specter_conn_destroy(struct libev_conn *cn);
+
+static enum libev_ret specter_timeout_cb(struct libev_conn *cn)
+{
+	log_e("[%d] connection failed: timed out", cn->w.fd);
+
+	return LIBEV_RET_CLOSE_CONN;
+}
 
 static enum libev_ret specter_pass_to_client(struct libev_conn *cn)
 {
@@ -59,26 +72,18 @@ static enum libev_ret specter_pass_to_host(struct libev_conn *cn)
 
 static enum libev_ret specter_connected(struct libev_conn *cn)
 {
-	int error;
 	struct libev_conn *client;
 	struct specter_context *host_ctx;
 	struct specter_context *client_ctx;
-	socklen_t optlen = sizeof(error);
 
-	if (getsockopt(cn->w.fd, SOL_SOCKET, SO_ERROR, &error, &optlen) != 0) {
-		log_e("getsockopt failed: %s", strerror(errno));
-
+	libev_conn_off_timer(cn);
+	if (libev_socket_error_occurred(cn->w.fd) != 0)
 		return LIBEV_RET_ERROR;
-	}
-	if (error != 0) {
-		log_e("connection failed: %s", strerror(error));
-
-		return LIBEV_RET_ERROR;
-	}
 
 	host_ctx = cn->ctx;
 	assert(host_ctx->type == CONTEXT_FOR_HOST);
 
+	libev_conn_on_read(cn);
 	cn->read_cb = specter_pass_to_client;
 	cn->write_cb = NULL;
 
@@ -90,6 +95,7 @@ static enum libev_ret specter_connected(struct libev_conn *cn)
 	client_ctx = client->ctx;
 	assert(client_ctx->type == CONTEXT_FOR_CLIENT);
 
+	libev_conn_on_read(client);
 	client->read_cb = specter_pass_to_host;
 	client->write_cb = NULL;
 
@@ -139,7 +145,9 @@ static enum libev_ret specter_connect_to(struct libev_conn *cn,
 
 	config = config_get();
 	timeout = config->node_connect_timeout;
-	if (libev_connect_to(host_cn, port, host, specter_connected, timeout) != LIBEV_RET_OK)
+	if (libev_connect_to(host_cn, port, host,
+			     specter_connected, timeout,
+			     specter_timeout_cb) != LIBEV_RET_OK)
 		return LIBEV_RET_ERROR;
 
 	return LIBEV_RET_OK;
@@ -205,11 +213,6 @@ static enum libev_ret specter_conn_destroy(struct libev_conn *cn)
 	return LIBEV_RET_OK;
 }
 
-void specter_new_node_conn_init(struct libev_conn *cn)
-{
-	(void)cn;
-}
-
 void specter_new_client_conn_init(struct libev_conn *cn)
 {
 	struct specter_context *ctx;
@@ -221,4 +224,103 @@ void specter_new_client_conn_init(struct libev_conn *cn)
 	cn->write_cb = NULL;
 	cn->read_cb = specter_read_socks_req;
 	cn->destroy_cb = specter_conn_destroy;
+}
+
+static enum libev_ret libev_accept_new_node_cb(struct libev_conn *listen_cn)
+{
+	struct libev_conn *cn;
+
+	(void)listen_cn;
+	(void)cn;
+
+	return LIBEV_RET_OK;
+}
+
+static enum libev_ret libev_accept_new_client_cb(struct libev_conn *listen_cn)
+{
+	struct libev_conn *cn;
+
+	cn = libev_accept(listen_cn);
+	if (cn == NULL)
+		// ignore fails
+		return LIBEV_RET_OK;
+
+	specter_new_client_conn_init(cn);
+	libev_conn_on_read(cn);
+
+	return LIBEV_RET_OK;
+}
+
+static enum libev_ret libev_close_after_write(struct libev_conn *cn)
+{
+	(void)cn;
+
+	if (cn->rbuf.size != 0)
+		return LIBEV_RET_OK;
+
+	log_d("[%d] all data succesfully sent to master", cn->w.fd);
+
+	return LIBEV_RET_CLOSE_CONN;
+}
+
+static enum libev_ret libev_continue_init_cb(struct libev_conn *cn)
+{
+	struct config *config = config_get();
+
+	libev_conn_off_timer(cn);
+	if (libev_socket_error_occurred(cn->w.fd) != 0) {
+		libev_stop();
+
+		return LIBEV_RET_ERROR;
+	}
+
+	if (libev_bind_listen_tcp_socket(config->listen_port, config->listen_addr,
+					 libev_accept_new_client_cb) != LIBEV_RET_OK)
+		return LIBEV_RET_ERROR;
+
+	if (libev_bind_listen_tcp_socket(config->listen_node_port, config->listen_node_addr,
+					 libev_accept_new_node_cb) != LIBEV_RET_OK)
+		return LIBEV_RET_ERROR;
+
+	log_d("success connected to designator");
+	{
+		char data[64] = {0};
+		uint8_t cmd = DESIGNATOR_COMMAND_PUT;
+		uint16_t port = htons(config->listen_node_port);
+		uint32_t ip = htonl(config->listen_node_addr);
+
+		pack_init(req, data, sizeof(data));
+		pack(req, &cmd, sizeof(cmd));
+		pack(req, &ip, sizeof(ip));
+		pack(req, &port, sizeof(port));
+
+		cn->write_cb = libev_close_after_write;
+		libev_send(cn, pack_data(req), pack_len(req));
+	}
+
+	return LIBEV_RET_OK;
+}
+
+static enum libev_ret specter_timeout_break_all_cb(struct libev_conn *cn)
+{
+	log_e("timeout on connect [%d], exiting ...", cn->w.fd);
+	libev_stop();
+
+	return LIBEV_RET_CLOSE_CONN;
+}
+
+int specter_initialize(void)
+{
+	struct config *config = config_get();
+	struct libev_conn *cn;
+
+	cn = libev_create_conn();
+	if (libev_connect_to(cn, htons(config->designator_port),
+			     htonl(config->designator_addr),
+			     libev_continue_init_cb,
+			     config->designator_connect_timeout,
+			     specter_timeout_break_all_cb) != LIBEV_RET_OK)
+		return -1;
+
+	return 0;
 }

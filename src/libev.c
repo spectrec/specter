@@ -25,6 +25,25 @@ static void libev_cleanup(void)
 	ev_loop_destroy(__loop);
 }
 
+int libev_socket_error_occurred(int fd)
+{
+	int error;
+	socklen_t optlen = sizeof(error);
+
+	if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &optlen) != 0) {
+		log_e("getsockopt failed: %s", strerror(errno));
+
+		return 1;
+	}
+	if (error != 0) {
+		log_e("connection failed: %s", strerror(error));
+
+		return 1;
+	}
+
+	return 0;
+}
+
 static int libev_set_socket_nonblock(int fd)
 {
 	assert(fd != -1);
@@ -41,54 +60,6 @@ static int libev_set_socket_nonblock(int fd)
 	}
 
 	return 0;
-}
-
-#define LISTEN_QUEUE_SIZE 16
-static int libev_bind_listen_tcp_socket(uint16_t port, uint32_t addr)
-{
-	int fd = socket(AF_INET, SOCK_STREAM, 0);
-	if (fd < 0) {
-		log_e("can't create socket: %s", strerror(errno));
-
-		return -1;
-	}
-
-	long reuse_addr = 1;
-	if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse_addr, sizeof(reuse_addr)) != 0) {
-		log_e("can't setsockopt: %s", strerror(errno));
-		(void)close(fd);
-
-		return -1;
-	}
-
-	if (libev_set_socket_nonblock(fd) != 0) {
-		(void)close(fd);
-
-		return -1;
-	}
-
-	struct sockaddr_in sa;
-	memset(&sa, 0, sizeof(sa));
-
-	sa.sin_family = AF_INET;
-	sa.sin_port = htons(port);
-	sa.sin_addr.s_addr = htonl(addr);
-
-	if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
-		log_e("bind error: %s", strerror(errno));
-		(void)close(fd);
-
-		return -1;
-	}
-
-	if (listen(fd, LISTEN_QUEUE_SIZE) != 0) {
-		log_e("listen error: %s", strerror(errno));
-		(void)close(fd);
-
-		return -1;
-	}
-
-	return fd;
 }
 
 #define DEFAULT_READ_LEN 4096
@@ -135,9 +106,9 @@ static void libev_write_cb(EV_P_ ev_io *w, int revent)
 {
 	struct libev_conn *lc = LIBEV_CONN(w, w);
 
+	(void)loop;
 	(void)revent;
 
-	ev_timer_stop(__loop, &lc->t);
 	if (lc->wbuf.size != 0) {
 		ssize_t ret = send(w->fd, lc->wbuf.data, lc->wbuf.size, 0);
 		if (ret < 0) {
@@ -153,11 +124,9 @@ static void libev_write_cb(EV_P_ ev_io *w, int revent)
 		sbuf_shrink(&lc->wbuf, ret);
 	}
 
-	if (lc->wbuf.size == 0) {
-		ev_io_stop(EV_A_ w);
-		ev_io_set(w, w->fd, EV_READ);
-		ev_io_start(EV_A_ w);
-	}
+	if (lc->wbuf.size != 0 && (w->events & EV_WRITE) == 0)
+		// It may be possible, if called from `libev_send()'
+		libev_conn_on_write(lc);
 
 	if (lc->write_cb != NULL && lc->write_cb(lc) != LIBEV_RET_OK)
 		libev_cleanup_conn(lc);
@@ -201,19 +170,164 @@ static void libev_cleanup_cb(EV_P_ ev_cleanup *gc)
 	libev_cleanup_conn(lc);
 }
 
+static void libev_accept_cb(EV_P_ ev_io *w, int events)
+{
+	struct libev_conn *cn = LIBEV_CONN(w, w);
+
+	(void)loop;
+	(void)events;
+
+	if (cn->accept_cb(cn) != LIBEV_RET_OK)
+		libev_cleanup_conn(cn);
+}
+
 static void libev_timeout_cb(EV_P_ ev_timer *t)
 {
 	struct libev_conn *lc = LIBEV_CONN(t, t);
 
 	(void)loop;
 
-	log_e("[%d] connection failed: timed out", lc->w.fd);
-	libev_cleanup_conn(lc);
+	if (lc->timeout_cb == NULL)
+		log_w("timeout on connect [%d]", lc->w.fd);
+
+	if (lc->timeout_cb == NULL ||
+	    lc->timeout_cb(lc) != LIBEV_RET_OK)
+		libev_cleanup_conn(lc);
+}
+
+static void libev_add_events(struct libev_conn *cn, int events)
+{
+	if ((cn->w.events & events) == events)
+		return;
+
+	ev_io_stop(__loop, &cn->w);
+	ev_io_set(&cn->w, cn->w.fd, cn->w.events | events);
+	ev_io_start(__loop, &cn->w);
+}
+
+static void libev_del_events(struct libev_conn *cn, int events)
+{
+	if ((cn->w.events & events) == 0)
+		return;
+
+	ev_io_stop(__loop, &cn->w);
+	ev_io_set(&cn->w, cn->w.fd, cn->w.events & (~events));
+	ev_io_start(__loop, &cn->w);
+}
+
+void libev_conn_on_read(struct libev_conn *cn)
+{
+	libev_add_events(cn, EV_READ);
+}
+
+void libev_conn_off_read(struct libev_conn *cn)
+{
+	libev_del_events(cn, EV_READ);
+}
+
+void libev_conn_on_write(struct libev_conn *cn)
+{
+	libev_add_events(cn, EV_WRITE);
+}
+
+void libev_conn_off_write(struct libev_conn *cn)
+{
+	libev_del_events(cn, EV_WRITE);
+}
+
+void libev_conn_off_timer(struct libev_conn *cn)
+{
+	ev_timer_stop(__loop, &cn->t);
+}
+
+struct libev_conn *libev_accept(struct libev_conn *listen_cn)
+{
+	int client_fd;
+	struct libev_conn *cn;
+	struct sockaddr_in sa;
+	socklen_t sa_len = sizeof(sa);
+
+	client_fd = accept(listen_cn->w.fd, (struct sockaddr *)&sa, &sa_len);
+	if (client_fd < 0) {
+		log_e("can't accept new client: %s", strerror(errno));
+
+		return NULL;
+	}
+
+	if (libev_set_socket_nonblock(client_fd) != 0) {
+		(void)close(client_fd);
+
+		return NULL;
+	}
+
+	cn = libev_create_conn();
+	ev_io_init(&cn->w, libev_cb, client_fd, EV_NONE);
+	ev_io_start(__loop, &cn->w);
+
+	log_d("accept new client [%d]", client_fd);
+
+	return cn;
+}
+
+#define LISTEN_QUEUE_SIZE 16
+enum libev_ret libev_bind_listen_tcp_socket(uint16_t port, uint32_t addr,
+					    libev_cb_t listen_parser)
+{
+	int fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) {
+		log_e("can't create socket: %s", strerror(errno));
+
+		return -1;
+	}
+
+	long reuse_addr = 1;
+	if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse_addr, sizeof(reuse_addr)) != 0) {
+		log_e("can't setsockopt: %s", strerror(errno));
+		(void)close(fd);
+
+		return -1;
+	}
+
+	if (libev_set_socket_nonblock(fd) != 0) {
+		(void)close(fd);
+
+		return -1;
+	}
+
+	struct sockaddr_in sa;
+	memset(&sa, 0, sizeof(sa));
+
+	sa.sin_family = AF_INET;
+	sa.sin_port = htons(port);
+	sa.sin_addr.s_addr = htonl(addr);
+
+	if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+		log_e("bind error: %s", strerror(errno));
+		(void)close(fd);
+
+		return -1;
+	}
+
+	if (listen(fd, LISTEN_QUEUE_SIZE) != 0) {
+		log_e("listen error: %s", strerror(errno));
+		(void)close(fd);
+
+		return -1;
+	}
+
+	struct libev_conn *cn = libev_create_conn();
+	ev_io_init(&cn->w, libev_accept_cb, fd, EV_READ);
+	ev_io_start(__loop, &cn->w);
+	cn->accept_cb = listen_parser;
+
+	return 0;
 }
 
 struct libev_conn *libev_create_conn(void)
 {
 	struct libev_conn *cn;
+
+	assert(__loop != NULL);
 
 	cn = calloc(1, sizeof(*cn));
 	assert(cn != NULL);
@@ -252,15 +366,17 @@ void libev_cleanup_conn(struct libev_conn *lc)
 
 // XXX: `port' and `host' should have network byte order
 enum libev_ret libev_connect_to(struct libev_conn *cn, uint16_t port,
-				uint32_t host, libev_cb_t cb, float timeout)
+				uint32_t host, libev_cb_t cb,
+				float timeout, libev_cb_t timeout_cb)
 {
 	struct sockaddr_in sa;
 	int fd;
 
 	fd = socket(AF_INET, SOCK_STREAM, 0);
-	ev_io_init(&cn->w, libev_cb, fd, EV_READ | EV_WRITE);
+	ev_io_init(&cn->w, libev_cb, fd, EV_WRITE);
 	ev_io_start(__loop, &cn->w);
 
+	cn->timeout_cb = timeout_cb;
 	ev_timer_init(&cn->t, libev_timeout_cb, timeout, 0.);
 	ev_timer_start(__loop, &cn->t);
 
@@ -298,61 +414,6 @@ enum libev_ret libev_connect_to(struct libev_conn *cn, uint16_t port,
 	return LIBEV_RET_OK;
 }
 
-static struct libev_conn *libev_accept_new_conn(EV_P_ ev_io *w)
-{
-	int client_fd;
-	struct libev_conn *cn;
-	struct sockaddr_in sa;
-	socklen_t sa_len = sizeof(sa);
-
-	client_fd = accept(w->fd, (struct sockaddr *)&sa, &sa_len);
-	if (client_fd < 0) {
-		log_e("can't accept new client: %s", strerror(errno));
-
-		return NULL;
-	}
-
-	if (libev_set_socket_nonblock(client_fd) != 0) {
-		(void)close(client_fd);
-
-		return NULL;
-	}
-
-	cn = libev_create_conn();
-	ev_io_init(&cn->w, libev_cb, client_fd, EV_READ | EV_WRITE);
-	ev_io_start(loop, &cn->w);
-
-	log_d("accept new client [%d]", client_fd);
-
-	return cn;
-}
-
-static void libev_accept_new_node_cb(EV_P_ ev_io *w, int revents)
-{
-	struct libev_conn *cn;
-
-	(void)revents;
-
-	cn = libev_accept_new_conn(EV_A_ w);
-	if (cn == NULL)
-		return;
-
-	specter_new_node_conn_init(cn);
-}
-
-static void libev_accept_new_client_cb(EV_P_ ev_io *w, int revents)
-{
-	struct libev_conn *cn;
-
-	(void)revents;
-
-	cn = libev_accept_new_conn(EV_A_ w);
-	if (cn == NULL)
-		return;
-
-	specter_new_client_conn_init(cn);
-}
-
 static void libev_init_signal_handlers()
 {
 	static struct ev_signal __sigint_watcher;
@@ -373,75 +434,10 @@ static void libev_init_signal_handlers()
 	ev_signal_start(__loop, &__sigquit_watcher);
 }
 
-static enum libev_ret libev_close_after_write(struct libev_conn *cn)
-{
-	(void)cn;
-
-	if (cn->rbuf.size != 0)
-		return LIBEV_RET_OK;;
-
-	log_d("[%d] all data succesfully sent to master", cn->w.fd);
-
-	return LIBEV_RET_ERROR; // return error to close connection
-}
-
-static enum libev_ret libev_connected_to_master(struct libev_conn *cn)
-{
-	static struct ev_io __client_watcher;
-	static struct ev_io __node_watcher;
-	struct config *config = config_get();
-	int fd;
-
-	fd = libev_bind_listen_tcp_socket(config->listen_port, config->listen_addr);
-	if (fd == -1)
-		return LIBEV_RET_ERROR;
-
-	ev_io_init(&__client_watcher, libev_accept_new_client_cb, fd, EV_READ);
-	ev_io_start(__loop, &__client_watcher);
-
-	fd = libev_bind_listen_tcp_socket(config->listen_node_port, config->listen_node_addr);
-	if (fd == -1)
-		return LIBEV_RET_ERROR;
-
-	ev_io_init(&__node_watcher, libev_accept_new_node_cb, fd, EV_READ);
-	ev_io_start(__loop, &__node_watcher);
-
-	log_d("success connected to designator");
-	{
-		char data[64] = {0};
-		uint8_t cmd = DESIGNATOR_COMMAND_PUT;
-		uint16_t port = htons(config->listen_node_port);
-		uint32_t ip = htonl(config->listen_node_addr);
-
-		pack_init(req, data, sizeof(data));
-		pack(req, &cmd, sizeof(cmd));
-		pack(req, &ip, sizeof(ip));
-		pack(req, &port, sizeof(port));
-
-		cn->write_cb = libev_close_after_write;
-		libev_send(cn, pack_data(req), pack_len(req));
-	}
-
-	return LIBEV_RET_OK;
-}
-
 int libev_initialize()
 {
-	struct config *config = config_get();
-	struct libev_conn *cn;
-	uint32_t host;
-	uint16_t port;
-	float timeout;
-
 	__loop = EV_DEFAULT;
 	libev_init_signal_handlers();
-
-	cn = libev_create_conn();
-	host = htonl(config->designator_addr);
-	port = htons(config->designator_port);
-	timeout = config->designator_connect_timeout;
-	if (libev_connect_to(cn, port, host, libev_connected_to_master, timeout) != LIBEV_RET_OK)
-		return -1;
 
 	return 0;
 }
@@ -451,15 +447,15 @@ void libev_run()
 	ev_run(__loop, 0);
 }
 
+void libev_stop()
+{
+	ev_break(__loop, EVBREAK_ALL);
+}
+
 void libev_send(struct libev_conn *cn, const void *data, size_t size)
 {
 	sbuf_append(&cn->wbuf, data, size);
 
 	// Try to send immidiatly
 	libev_write_cb(__loop, &cn->w, EV_WRITE);
-	if (cn->wbuf.size != 0 && (cn->w.events & EV_WRITE) == 0) {
-		ev_io_stop(__loop, &cn->w);
-		ev_io_set(&cn->w, cn->w.fd, EV_WRITE | EV_READ);
-		ev_io_start(__loop, &cn->w);
-	}
 }

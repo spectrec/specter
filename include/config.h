@@ -20,6 +20,8 @@ struct config {
 
 	float node_connect_timeout;
 	float designator_connect_timeout;
+
+	uint16_t tunnel_node_count;
 };
 
 struct config *config_get(void);

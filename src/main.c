@@ -1,5 +1,6 @@
 #include "libev.h"
 #include "config.h"
+#include "specter.h"
 
 int main(void)
 {
@@ -7,6 +8,9 @@ int main(void)
 		return -1;
 
 	if (libev_initialize() != 0)
+		return -1;
+
+	if (specter_initialize() != 0)
 		return -1;
 
 	libev_run();

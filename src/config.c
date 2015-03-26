@@ -82,6 +82,8 @@ static int config_store_value(const char *key, const char *value)
 		__config.public_key = strdup(value);
 	} else if (strcmp(key, "private_key") == 0) {
 		__config.private_key = strdup(value);
+	} else if (strcmp(key, "tunnel_node_count") == 0) {
+		__config.tunnel_node_count = (uint16_t)convert_str_to_long(value);
 	} else if (strcmp(key, "listen_port") == 0) {
 		__config.listen_port = (uint16_t)convert_str_to_long(value);
 	} else if (strcmp(key, "listen_node_port") == 0) {
