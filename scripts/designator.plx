@@ -75,11 +75,11 @@ my %HANDLERS = (
 	},
 
 	CMD_GET() => sub {
-		shift->push_read(chunk => 1, sub {
+		shift->push_read(chunk => 2, sub {
 			my ($self, $data) = @_;
 
 			my @keys = keys %SERVERS_INFO;
-			my $count = unpack 'C', $data;
+			my $count = unpack 'n', $data;
 			my @indexes = map { int(rand(@keys)) } 1 .. $count;
 
 			return safe_destroy($self)

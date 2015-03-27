@@ -50,7 +50,7 @@ tcp_connect('127.0.0.1', 7777, sub {
 
 	$handle->push_write(pack 'C5n', 1, 127,0,0,1, 1665);
 	$handle->push_write(pack 'C5n', 1, 213,180,204,3, 80); # ya.ru
-	$handle->push_write(pack 'C2',  2, 2);
+	$handle->push_write(pack 'Cn',  2, 2);
 });
 
 $cv->recv();
