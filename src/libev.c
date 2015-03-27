@@ -124,7 +124,9 @@ static void libev_write_cb(EV_P_ ev_io *w, int revent)
 		sbuf_shrink(&lc->wbuf, ret);
 	}
 
-	if (lc->wbuf.size != 0 && (w->events & EV_WRITE) == 0)
+	if (lc->wbuf.size == 0)
+		libev_conn_off_write(lc);
+	else if ((w->events & EV_WRITE) == 0)
 		// It may be possible, if called from `libev_send()'
 		libev_conn_on_write(lc);
 
