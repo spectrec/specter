@@ -15,8 +15,9 @@ void sbuf_reset(struct sbuf *buf);
 void sbuf_delete(struct sbuf *buf);
 void sbuf_shrink(struct sbuf *buf, size_t size);
 void sbuf_ensure(struct sbuf *buf, size_t size);
-void sbuf_append(struct sbuf *buf, const void *data, size_t size);
 void sbuf_insert(struct sbuf *buf, const void *data, size_t size);
+void sbuf_append(struct sbuf *buf, const void *data, size_t size);
+void sbuf_unshift(struct sbuf *buf, const void *data, size_t size);
 
 void sbuf_printf(struct sbuf *buf, const char *format, ...)
 	__attribute__((format(printf, 2, 3)));

@@ -58,6 +58,14 @@ void sbuf_append(struct sbuf *buf, const void *data, size_t size)
 	buf->size += size;
 }
 
+void sbuf_unshift(struct sbuf *buf, const void *data, size_t size)
+{
+	sbuf_ensure(buf, size);
+	memmove(buf->data + size, buf->data, buf->size);
+	memcpy(buf->data, data, size);
+	buf->size += size;
+}
+
 void sbuf_shrink(struct sbuf *buf, size_t size)
 {
 	if (size > buf->size) {
