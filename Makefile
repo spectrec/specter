@@ -27,6 +27,14 @@ ifeq (${COV},1)
 CFLAGS += --coverage
 endif
 
+ifneq (${DEBUG},1)
+CFLAGS += -O3
+CFLAGS += -fno-strict-aliasing
+else
+CFLAGS += -O0
+NO_LTO = 1
+endif
+
 ifeq (${NO_LTO},)
 CFLAGS += -flto
 LDFLAGS += -flto
