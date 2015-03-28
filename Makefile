@@ -1,6 +1,6 @@
 CC = gcc
 
-CFLAGS = -std=gnu99 \
+CFLAGS = -std=gnu99 -ggdb3 \
 	 -D_GNU_SOURCE \
 	 -Iinclude \
 	 -Wall \
