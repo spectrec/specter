@@ -1,6 +1,8 @@
+#include <fcntl.h>
 #include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
@@ -32,9 +34,20 @@ enum specter_ctx_is {
 	CLIENT_CTX_IS_SBUF	= 2,
 };
 
-#define DESIGNATOR_RESP_RECORD_SIZE (4 + 2)
-#define NODE_RECORD_SIZE (4 + 2 + 1)
+#define PUBLIC_KEY_SIZE 0
 #define SESSION_KEY_SIZE 32
+
+#define NODE_RECORD_SIZE (4 + 2 + 1 + SESSION_KEY_SIZE)
+#define DESIGNATOR_RESP_RECORD_SIZE (4 + 2 + PUBLIC_KEY_SIZE)
+
+static int __urandom_fd = -1;
+
+__attribute__((destructor))
+static void specter_cleanup(void)
+{
+	if (__urandom_fd != -1)
+		(void)close(__urandom_fd);
+}
 
 // TODO: create global private key and use it
 
@@ -56,6 +69,27 @@ struct specter_context {
 		} *node_info;
 	};
 };
+
+static enum libev_ret specter_generate_session_key(char *buf, ssize_t key_len)
+{
+	if (__urandom_fd == -1)
+		__urandom_fd = open("/dev/urandom", O_RDONLY);
+
+	if (__urandom_fd == -1) {
+		log_e("can't gen session key: %s", strerror(errno));
+		return LIBEV_RET_ERROR;
+	}
+
+	if (read(__urandom_fd, buf, key_len) != key_len) {
+		log_e("gen session key failed: %s", strerror(errno));
+		(void)close(__urandom_fd);
+		__urandom_fd = -1;
+
+		return LIBEV_RET_ERROR;
+	}
+
+	return LIBEV_RET_OK;
+}
 
 static enum libev_ret specter_conn_destroy(struct libev_conn *cn)
 {
@@ -233,6 +267,7 @@ static enum libev_ret specter_read_next_node_info(struct libev_conn *cn)
 	struct specter_context *next_node_ctx, *ctx;
 	struct config *config = config_get();
 	struct libev_conn *next_node_cn;
+	char *session_key;
 	uint8_t *flags;
 	uint16_t *port;
 	uint32_t *ip;
@@ -241,10 +276,11 @@ static enum libev_ret specter_read_next_node_info(struct libev_conn *cn)
 		return LIBEV_RET_OK;
 
 	unpack_init(r, cn->rbuf.data, cn->rbuf.size);
+	session_key = unpack(r, SESSION_KEY_SIZE);
 	ip = unpack(r, sizeof(*ip));
 	port = unpack(r, sizeof(*port));
 	flags = unpack(r, sizeof(*flags));
-	assert(ip != NULL && port != NULL && flags != NULL);
+	assert(session_key != NULL && ip != NULL && port != NULL && flags != NULL);
 
 	next_node_cn = libev_create_conn();
 	next_node_ctx = specter_create_context_for(CONTEXT_FOR_HOST, CTX_IS_NONE);
@@ -254,6 +290,7 @@ static enum libev_ret specter_read_next_node_info(struct libev_conn *cn)
 	ctx = specter_create_context_for(CONTEXT_FOR_CLIENT, CLIENT_CTX_IS_FLAGS);
 	ctx->node_info->host = next_node_cn;
 	ctx->node_info->flags = *flags;
+	memcpy(ctx->node_info->session_key, session_key, SESSION_KEY_SIZE);
 	specter_set_ctx(cn, ctx);
 
 	if (libev_connect_to(next_node_cn, *port, *ip,
@@ -324,6 +361,7 @@ static enum libev_ret specter_make_tunnel(struct libev_conn *client,
 	uint8_t flags = SPECTER_FLAG_EXIT_NODE;
 	struct config *config = config_get();
 	struct libev_conn *next_node_cn;
+	char session_key[SESSION_KEY_SIZE] = {0};
 	struct sbuf req;
 
 	ctx = client->ctx;
@@ -336,6 +374,11 @@ static enum libev_ret specter_make_tunnel(struct libev_conn *client,
 	assert(next_node_ip_p != NULL && next_node_port_p != NULL);
 
 	sbuf_init(&req);
+	if (specter_generate_session_key(session_key, SESSION_KEY_SIZE) != LIBEV_RET_OK)
+		return LIBEV_RET_ERROR;
+	memcpy(ctx->node_info->session_key, session_key, SESSION_KEY_SIZE);
+
+	sbuf_append(&req, session_key, SESSION_KEY_SIZE);
 	sbuf_append(&req, &dest_ip, sizeof(dest_ip));
 	sbuf_append(&req, &dest_port, sizeof(dest_port));
 	sbuf_append(&req, &flags, sizeof(flags));
@@ -345,10 +388,15 @@ static enum libev_ret specter_make_tunnel(struct libev_conn *client,
 		uint8_t flags = SPECTER_FLAG_NONE;
 
 		assert(ip != NULL && port != NULL);
+		if (specter_generate_session_key(session_key, SESSION_KEY_SIZE) != LIBEV_RET_OK) {
+			sbuf_delete(&req);
+			return LIBEV_RET_ERROR;
+		}
 
 		sbuf_unshift(&req, &flags, sizeof(flags));
 		sbuf_unshift(&req, port, sizeof(*port));
 		sbuf_unshift(&req, ip, sizeof(*ip));
+		sbuf_unshift(&req, session_key, SESSION_KEY_SIZE);
 	}
 
 	next_node_ip = *next_node_ip_p;
