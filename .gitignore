@@ -3,3 +3,4 @@
 .clang_complete
 specter
 tags
+*.pem

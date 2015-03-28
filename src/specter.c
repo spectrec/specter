@@ -3,9 +3,12 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <arpa/inet.h>
+#include <sys/types.h>
 #include <sys/socket.h>
 
+#include "rsa.h"
 #include "log.h"
 #include "pack.h"
 #include "libev.h"
@@ -30,19 +33,28 @@ enum specter_flags {
 	SPECTER_FLAG_ENABLE_CIPHERING	= 2,
 };
 
-#define PUBLIC_KEY_SIZE 0
+#define PUBLIC_KEY_SIZE 451
 #define SESSION_KEY_SIZE 32
 
+#define ENCODED_NODE_RECORD_SIZE RSA_BLOCK_SIZE
 #define NODE_RECORD_SIZE (4 + 2 + 1 + SESSION_KEY_SIZE)
+
+#define ENCODED_DESIGNATOR_RECORD_SIZE 0
 #define DESIGNATOR_RESP_RECORD_SIZE (4 + 2 + PUBLIC_KEY_SIZE)
 
 static int __urandom_fd = -1;
+static char *__rsa_public_key;
+static char *__rsa_private_key;
+static uint32_t __rsa_public_key_len;
 
 __attribute__((destructor))
 static void specter_cleanup(void)
 {
 	if (__urandom_fd != -1)
 		(void)close(__urandom_fd);
+
+	free(__rsa_public_key);
+	free(__rsa_private_key);
 }
 
 // TODO: create global private key and use it
@@ -315,7 +327,6 @@ static enum libev_ret specter_node_connected_to_next_node(struct libev_conn *nex
 		client_ctx->node->flags |= SPECTER_FLAG_ENABLE_CIPHERING;
 	}
 
-	ctx->client->read_cb = specter_decode_and_pass_to_chain;
 	if (ctx->client->rbuf.size != 0)
 		return ctx->client->read_cb(ctx->client);
 
@@ -327,15 +338,23 @@ static enum libev_ret specter_read_next_node_info(struct libev_conn *cn)
 	struct specter_context *next_node_ctx, *ctx;
 	struct config *config = config_get();
 	struct libev_conn *next_node_cn;
+	char node_record[RSA_BLOCK_SIZE];
 	char *session_key;
 	uint8_t *flags;
 	uint16_t *port;
 	uint32_t *ip;
+	int len;
 
-	if (cn->rbuf.size < NODE_RECORD_SIZE)
+	if (cn->rbuf.size < ENCODED_NODE_RECORD_SIZE)
 		return LIBEV_RET_OK;
 
-	unpack_init(r, cn->rbuf.data, cn->rbuf.size);
+	len = private_decrypt(cn->rbuf.data, ENCODED_NODE_RECORD_SIZE, __rsa_private_key, node_record);
+	if (len != NODE_RECORD_SIZE) {
+		log_e("[%d] decrypt error, invalid packet", cn->w.fd);
+		return LIBEV_RET_ERROR;
+	}
+
+	unpack_init(r, node_record, len);
 	session_key = unpack(r, SESSION_KEY_SIZE);
 	ip = unpack(r, sizeof(*ip));
 	port = unpack(r, sizeof(*port));
@@ -359,7 +378,7 @@ static enum libev_ret specter_read_next_node_info(struct libev_conn *cn)
 			     specter_timeout_cb) != LIBEV_RET_OK)
 		return LIBEV_RET_ERROR;
 
-	sbuf_shrink(&cn->rbuf, NODE_RECORD_SIZE);
+	sbuf_shrink(&cn->rbuf, ENCODED_NODE_RECORD_SIZE);
 	cn->read_cb = NULL;
 
 	return LIBEV_RET_OK;
@@ -416,9 +435,13 @@ static enum libev_ret specter_make_tunnel(struct libev_conn *root,
 	uint32_t *next_node_ip_p, next_node_ip;
 	uint8_t flags = SPECTER_FLAG_EXIT_NODE;
 	struct config *config = config_get();
+	char encoded_node_record[RSA_BLOCK_SIZE];
 	char session_key[SESSION_KEY_SIZE];
+	char node_record[NODE_RECORD_SIZE];
 	struct libev_conn *next_node_cn;
+	char *public_key;
 	struct sbuf req;
+	int encoded_len;
 
 	ctx = root->ctx;
 	assert(ctx->type == CONTEXT_FOR_ROOT);
@@ -426,7 +449,8 @@ static enum libev_ret specter_make_tunnel(struct libev_conn *root,
 	unpack_init(r, ctx->root_node->data.data, ctx->root_node->data.size);
 	next_node_ip_p = unpack(r, sizeof(*next_node_ip_p));
 	next_node_port_p = unpack(r, sizeof(*next_node_port_p));
-	assert(next_node_ip_p != NULL && next_node_port_p != NULL);
+	public_key = unpack(r, PUBLIC_KEY_SIZE);
+	assert(next_node_ip_p != NULL && next_node_port_p != NULL && public_key != NULL);
 
 	sbuf_init(&req);
 	assert(ctx->root_node->keys != NULL);
@@ -434,26 +458,44 @@ static enum libev_ret specter_make_tunnel(struct libev_conn *root,
 		return LIBEV_RET_ERROR;
 	memcpy(ctx->root_node->keys[0].data, session_key, SESSION_KEY_SIZE);
 
-	sbuf_append(&req, session_key, SESSION_KEY_SIZE);
-	sbuf_append(&req, &dest_ip, sizeof(dest_ip));
-	sbuf_append(&req, &dest_port, sizeof(dest_port));
-	sbuf_append(&req, &flags, sizeof(flags));
+	pack_init(r, node_record, sizeof(node_record));
+	pack(r, session_key, SESSION_KEY_SIZE);
+	pack(r, &dest_ip, sizeof(dest_ip));
+	pack(r, &dest_port, sizeof(dest_port));
+	pack(r, &flags, sizeof(flags));
+
+	encoded_len = public_encrypt(pack_data(r), (int)pack_len(r), public_key, encoded_node_record);
+	if (encoded_len != ENCODED_NODE_RECORD_SIZE) {
+		log_e("[%d] encrypt error, invalid encrypted size", root->w.fd);
+		return LIBEV_RET_ERROR;
+	}
+	sbuf_append(&req, encoded_node_record, encoded_len);
+
 	for (uint16_t i = 1; i < config->tunnel_node_count; ++i) {
 		uint32_t *ip = unpack(r, sizeof(*ip));
 		uint16_t *port = unpack(r, sizeof(*port));
 		uint8_t flags = SPECTER_FLAG_NONE;
+		char *public_key = unpack(r, PUBLIC_KEY_SIZE);
 
-		assert(ip != NULL && port != NULL);
+		assert(ip != NULL && port != NULL && public_key != NULL);
 		if (specter_generate_session_key(session_key, SESSION_KEY_SIZE) != LIBEV_RET_OK) {
 			sbuf_delete(&req);
 			return LIBEV_RET_ERROR;
 		}
 		memcpy(ctx->root_node->keys[i].data, session_key, SESSION_KEY_SIZE);
 
-		sbuf_unshift(&req, &flags, sizeof(flags));
-		sbuf_unshift(&req, port, sizeof(*port));
-		sbuf_unshift(&req, ip, sizeof(*ip));
-		sbuf_unshift(&req, session_key, SESSION_KEY_SIZE);
+		pack_init(r, node_record, sizeof(node_record));
+		pack(r, session_key, SESSION_KEY_SIZE);
+		pack(r, ip, sizeof(*ip));
+		pack(r, port, sizeof(*port));
+		pack(r, &flags, sizeof(flags));
+
+		encoded_len = public_encrypt(pack_data(r), (int)pack_len(r), public_key, encoded_node_record);
+		if (encoded_len != ENCODED_NODE_RECORD_SIZE) {
+			log_e("[%d] encrypt error, invalid encrypted size", root->w.fd);
+			return LIBEV_RET_ERROR;
+		}
+		sbuf_unshift(&req, encoded_node_record, encoded_len);
 	}
 
 	next_node_ip = *next_node_ip_p;
@@ -651,16 +693,18 @@ static enum libev_ret libev_continue_init_cb(struct libev_conn *cn)
 
 	log_d("success connected to designator");
 	{
-		char data[64] = {0};
+		char data[1024] = {0};
 		uint8_t cmd = DESIGNATOR_COMMAND_PUT;
 		uint16_t port = htons(config->listen_node_port);
 		uint32_t ip = htonl(config->listen_node_addr);
+		uint32_t key_len = htonl(__rsa_public_key_len);
 
 		pack_init(req, data, sizeof(data));
 		pack(req, &cmd, sizeof(cmd));
 		pack(req, &ip, sizeof(ip));
 		pack(req, &port, sizeof(port));
-		// TODO: public key
+		pack(req, &key_len, sizeof(key_len));
+		pack(req, __rsa_public_key, __rsa_public_key_len);
 
 		cn->write_cb = libev_close_after_write;
 		libev_send(cn, pack_data(req), pack_len(req));
@@ -669,10 +713,56 @@ static enum libev_ret libev_continue_init_cb(struct libev_conn *cn)
 	return LIBEV_RET_OK;
 }
 
+static void cleanup_file(int *fd)
+{
+	if (*fd != -1)
+		(void)close(*fd);
+}
+
+int specter_read_rsa_key(const char *filename, char **key, uint32_t *size)
+{
+	int fd __attribute__((cleanup(cleanup_file))) = -1;
+	struct stat buf;
+	char *result;
+
+	if (stat(filename, &buf) != 0) {
+		log_e("failed to stat `%s': %s", filename, strerror(errno));
+		return -1;
+	}
+
+	result = malloc(buf.st_size + 1);
+	assert(result != NULL);
+
+	if ((fd = open(filename, O_RDONLY)) == -1) {
+		log_e("filed to open `%s': %s", filename, strerror(errno));
+		free(result);
+
+		return -1;
+	}
+
+	if (read(fd, result, buf.st_size) != buf.st_size) {
+		log_e("can't read full key");
+		free(result);
+
+		return -1;
+	}
+	result[buf.st_size] = '\0';
+
+	*key = result;
+	if (size != NULL)
+		*size = buf.st_size;
+
+	return 0;
+}
+
 int specter_initialize(void)
 {
 	struct config *config = config_get();
 	struct libev_conn *cn;
+
+	if (specter_read_rsa_key(config->public_key, &__rsa_public_key, &__rsa_public_key_len) != 0 ||
+	    specter_read_rsa_key(config->private_key, &__rsa_private_key, NULL) != 0)
+		return -1;
 
 	cn = libev_create_conn();
 	if (libev_connect_to(cn, htons(config->designator_port),

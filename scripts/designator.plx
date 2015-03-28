@@ -24,13 +24,13 @@ my %SERVERS_INFO;
 
 my %HANDLERS = (
 	CMD_PUT() => sub {
-		my $size = 6;
-		my $format = 'Nn';
+		my $size = 10;
+		my $format = 'NnN';
 
 		shift->push_read(chunk => $size, sub {
 			my ($self, $data) = @_;
 
-			my ($host_p, $port_p) = unpack $format, $data;
+			my ($host_p, $port_p, $pub_key_size) = unpack $format, $data;
 
 			my $host = pack 'N', $host_p;
 			my $port = pack 'n', $port_p;
@@ -41,6 +41,11 @@ my %HANDLERS = (
 				AE::log error => 'got invlid ip address';
 				return safe_destroy($self);
 			}
+
+			$self->push_read(chunk => $pub_key_size, sub {
+				my ($self, $data) = @_;
+				$SERVERS_INFO{ $host . $port }->{public_key} = $data;
+			});
 
 			my $t = AnyEvent->timer(
 				after		=> PING_EACH(),
@@ -71,6 +76,8 @@ my %HANDLERS = (
 				port		=> $port,
 				timer		=> $t,
 			};
+
+
 		});
 	},
 
@@ -91,6 +98,7 @@ my %HANDLERS = (
 
 				$self->push_write($info->{host});
 				$self->push_write($info->{port});
+				$self->push_write($info->{public_key});
 			}
 
 			$self->on_drain(\&safe_destroy);

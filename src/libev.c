@@ -79,7 +79,7 @@ static void libev_read_cb(EV_P_ ev_io *w, int revent)
 			if (errno == EAGAIN)
 				break;
 
-			log_e("recv error: %s", strerror(errno));
+			log_e("[%d] recv error: %s", w->fd, strerror(errno));
 			libev_cleanup_conn(lc);
 
 			return;

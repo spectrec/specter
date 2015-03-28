@@ -8,9 +8,10 @@ CFLAGS = -std=gnu99 -ggdb3 \
 	 -Werror \
 	 -MMD -MP
 
-LDFLAGS = -lev -ggdb3
+LDFLAGS = -lev -ggdb3 -lcrypto
 
-sources = src/main.c \
+sources = src/rsa.c \
+	  src/main.c \
 	  src/sbuf.c \
 	  src/libev.c \
 	  src/config.c \
