@@ -43,9 +43,11 @@ enum specter_flags {
 #define DESIGNATOR_RESP_RECORD_SIZE (4 + 2 + PUBLIC_KEY_SIZE)
 
 static int __urandom_fd = -1;
+static uint32_t __rsa_public_key_len;
+
 static char *__rsa_public_key;
 static char *__rsa_private_key;
-static uint32_t __rsa_public_key_len;
+static char *__rsa_designator_public_key;
 
 __attribute__((destructor))
 static void specter_cleanup(void)
@@ -55,9 +57,9 @@ static void specter_cleanup(void)
 
 	free(__rsa_public_key);
 	free(__rsa_private_key);
+	free(__rsa_designator_public_key);
 }
 
-// TODO: create global private key and use it
 struct session_key {
 	uint8_t data[SESSION_KEY_SIZE];
 	uint8_t position;
@@ -68,14 +70,18 @@ struct specter_context {
 
 	union {
 		struct libev_conn *client;
+		struct {
+			struct libev_conn *client;
+			struct session_key key;
+		} *designator;
 
-		struct specter_node_ctx {
+		struct {
 			struct libev_conn *host;
 			struct session_key key;
 			uint8_t flags;
 		} *node;
 
-		struct specter_root_node_ctx {
+		struct {
 			struct libev_conn *next_node;
 			struct session_key* keys;
 			struct sbuf data;
@@ -112,8 +118,13 @@ static enum libev_ret specter_conn_destroy(struct libev_conn *cn)
 	ctx = cn->ctx;
 	switch (ctx->type) {
 	case CONTEXT_FOR_NEXT_NODE:
-	case CONTEXT_FOR_DESIGNATOR:
 		pair_cn = ctx->client;
+		break;
+	case CONTEXT_FOR_DESIGNATOR:
+		pair_cn = ctx->designator->client;
+		free(ctx->designator);
+		ctx->designator = NULL;
+
 		break;
 	case CONTEXT_FOR_NODE:
 		pair_cn = ctx->node->host;
@@ -143,6 +154,8 @@ static enum libev_ret specter_conn_destroy(struct libev_conn *cn)
 
 		switch (nested_ctx->type) {
 		case CONTEXT_FOR_DESIGNATOR:
+			nested_ctx->designator->client = NULL;
+			break;
 		case CONTEXT_FOR_NEXT_NODE:
 			nested_ctx->client = NULL;
 			break;
@@ -173,6 +186,9 @@ static struct specter_context *specter_create_context_for(enum specter_context_f
 	ctx->type = type;
 	switch (ctx->type) {
 	case CONTEXT_FOR_DESIGNATOR:
+		ctx->designator = calloc(1, sizeof(*ctx->designator));
+		assert(ctx->designator != NULL);
+		break;
 	case CONTEXT_FOR_NEXT_NODE:
 		break;
 	case CONTEXT_FOR_NODE:
@@ -575,13 +591,18 @@ static enum libev_ret specter_response_nodes_cb(struct libev_conn *designator_cn
 	log_d("[%d] got nodes list", designator_cn->w.fd);
 
 	ctx = designator_cn->ctx;
-	client = ctx->client;
-	ctx->client = NULL;
+	client = ctx->designator->client;
+	ctx->designator->client = NULL;
 
 	client_ctx = client->ctx;
 	client_ctx->root_node->next_node = NULL;
 	sbuf_append(&client_ctx->root_node->data,
 		    designator_cn->rbuf.data, designator_cn->rbuf.size);
+
+	// decode data with designator's session key
+	specter_encode_data(&ctx->designator->key,
+			    client_ctx->root_node->data.data,
+			    client_ctx->root_node->data.size);
 
 	libev_conn_on_read(client);
 	client->read_cb = specter_read_socks_req;
@@ -598,6 +619,7 @@ static enum libev_ret specter_response_nodes_cb(struct libev_conn *designator_cn
 static enum libev_ret specter_request_nodes_cb(struct libev_conn *designator_cn)
 {
 	struct config *config = config_get();
+	struct specter_context *ctx = designator_cn->ctx;
 
 	designator_cn->write_cb = NULL;
 	libev_conn_off_timer(designator_cn);
@@ -605,13 +627,30 @@ static enum libev_ret specter_request_nodes_cb(struct libev_conn *designator_cn)
 		return LIBEV_RET_ERROR;
 
 	{
-		char buf[8] = {0};
+		char buf[512] = {0};
+		char payload[64] = {0};
+		char crypted_payload[512] = {0};
+		char session_key[SESSION_KEY_SIZE] = {0};
 		uint8_t command = DESIGNATOR_COMMAND_GET;
 		uint16_t count = htons(config->tunnel_node_count);
+		int32_t payload_len;
+
+		if (specter_generate_session_key(session_key, SESSION_KEY_SIZE) != LIBEV_RET_OK)
+			return LIBEV_RET_ERROR;
+		memcpy(ctx->designator->key.data, session_key, SESSION_KEY_SIZE);
+
+		pack_init(p, payload, sizeof(payload));
+		pack(p, &count, sizeof(count));
+		pack(p, session_key, SESSION_KEY_SIZE);
+
+		payload_len = public_encrypt(pack_data(p), pack_len(p),
+					     __rsa_designator_public_key, crypted_payload);
+		if (payload_len == -1)
+			return LIBEV_RET_ERROR;
 
 		pack_init(req, buf, sizeof(buf));
 		pack(req, &command, sizeof(command));
-		pack(req, &count, sizeof(count));
+		pack(req, crypted_payload, payload_len);
 
 		libev_send(designator_cn, pack_data(req), pack_len(req));
 		log_d("[%d] sent request for nodes", designator_cn->w.fd);
@@ -637,7 +676,7 @@ static enum libev_ret specter_accept_new_client_cb(struct libev_conn *listen_cn)
 
 	designator_cn = libev_create_conn();
 	ctx = specter_create_context_for(CONTEXT_FOR_DESIGNATOR);
-	ctx->client = cn;
+	ctx->designator->client = cn;
 	specter_set_ctx(designator_cn, ctx);
 
 	client_ctx = specter_create_context_for(CONTEXT_FOR_ROOT);
@@ -656,12 +695,28 @@ static enum libev_ret specter_accept_new_client_cb(struct libev_conn *listen_cn)
 	return LIBEV_RET_OK;
 }
 
-static enum libev_ret libev_close_after_write(struct libev_conn *cn)
+static enum libev_ret libev_read_designator_pub_key_cb(struct libev_conn *cn)
 {
-	(void)cn;
+	char *public_key;
+	uint32_t *key_len_p, key_len;
 
-	if (cn->rbuf.size != 0)
+	if (cn->rbuf.size < sizeof(*key_len_p))
+		// not fully read
 		return LIBEV_RET_OK;
+
+	unpack_init(r, cn->rbuf.data, cn->rbuf.size);
+	key_len_p = unpack(r, sizeof(*key_len_p));
+	assert(key_len_p != NULL);
+
+	key_len = ntohl(*key_len_p);
+	public_key = unpack(r, key_len);
+	if (public_key == NULL)
+		// not fully read
+		return LIBEV_RET_OK;
+
+	assert(__rsa_designator_public_key == NULL);
+	__rsa_designator_public_key = strndup(public_key, key_len);
+	assert(__rsa_designator_public_key != NULL);
 
 	return LIBEV_RET_CLOSE_CONN;
 }
@@ -670,6 +725,7 @@ static enum libev_ret libev_continue_init_cb(struct libev_conn *cn)
 {
 	struct config *config = config_get();
 
+	cn->write_cb = NULL;
 	libev_conn_off_timer(cn);
 	if (libev_socket_error_occurred(cn->w.fd) != 0) {
 		libev_stop();
@@ -706,8 +762,10 @@ static enum libev_ret libev_continue_init_cb(struct libev_conn *cn)
 		pack(req, &key_len, sizeof(key_len));
 		pack(req, __rsa_public_key, __rsa_public_key_len);
 
-		cn->write_cb = libev_close_after_write;
 		libev_send(cn, pack_data(req), pack_len(req));
+
+		cn->read_cb = libev_read_designator_pub_key_cb;
+		libev_conn_on_read(cn);
 	}
 
 	return LIBEV_RET_OK;

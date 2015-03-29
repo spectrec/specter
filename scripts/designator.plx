@@ -4,20 +4,27 @@ use warnings;
 use EV;
 use Socket;
 use AnyEvent;
+use Data::Dumper;
 use AnyEvent::Log;
 use AnyEvent::Socket;
 use AnyEvent::Handle;
+use Crypt::OpenSSL::RSA;
 
-use Data::Dumper;
+use autodie qw(:all);
 use Scalar::Util qw(refaddr);
-
-my $__port = 5432;
-my $cv = AnyEvent->condvar();
 
 sub CMD_PUT() { 1 }
 sub CMD_GET() { 2 }
 
+sub RSA_BLOCK_SIZE {}
+
 sub PING_EACH() { 5 } # seconds
+
+my $__port = 5432;
+my $public_key = read_file('public.pem');
+my $private_key = read_file('private.pem');
+my $rsa_private_key = Crypt::OpenSSL::RSA->new_private_key($private_key);
+$rsa_private_key->use_pkcs1_padding();
 
 my %AE_HANDLES;
 my %SERVERS_INFO;
@@ -45,6 +52,9 @@ my %HANDLERS = (
 			$self->push_read(chunk => $pub_key_size, sub {
 				my ($self, $data) = @_;
 				$SERVERS_INFO{ $host . $port }->{public_key} = $data;
+
+				$self->push_write(pack 'N', length $public_key);
+				$self->push_write($public_key);
 			});
 
 			my $t = AnyEvent->timer(
@@ -76,29 +86,33 @@ my %HANDLERS = (
 				port		=> $port,
 				timer		=> $t,
 			};
-
-
 		});
 	},
 
 	CMD_GET() => sub {
-		shift->push_read(chunk => 2, sub {
+		shift->push_read(chunk => ($rsa_private_key->size()), sub {
 			my ($self, $data) = @_;
 
-			my @keys = keys %SERVERS_INFO;
-			my $count = unpack 'n', $data;
-			my @indexes = map { int(rand(@keys)) } 1 .. $count;
+			my $payload = $rsa_private_key->decrypt($data);
+			my ($count, @key) = unpack 'nC*', $payload;
 
+			my @keys = keys %SERVERS_INFO;
 			return safe_destroy($self)
 				unless @keys;
 
+			my $session_key = {
+				key => \@key,
+				pos => 0,
+			};
+
+			my @indexes = map { int(rand(@keys)) } 1 .. $count;
 			foreach my $idx (@indexes) {
 				my $key = $keys[$idx];
 				my $info = $SERVERS_INFO{ $key };
 
-				$self->push_write($info->{host});
-				$self->push_write($info->{port});
-				$self->push_write($info->{public_key});
+				$self->push_write(encrypt_with_session_key($session_key, $info->{host}));
+				$self->push_write(encrypt_with_session_key($session_key, $info->{port}));
+				$self->push_write(encrypt_with_session_key($session_key, $info->{public_key}));
 			}
 
 			$self->on_drain(\&safe_destroy);
@@ -107,12 +121,21 @@ my %HANDLERS = (
 	}
 );
 
-sub terminate_server { $cv->send() }
+sub encrypt_with_session_key
+{
+	my ($key_ref, $data) = @_;
 
-$AnyEvent::Log::FILTER->level('debug');
-AnyEvent->signal(signal => 'TERM', cb => \&terminate_server);
-AnyEvent->signal(signal => 'QUIT', cb => \&terminate_server);
-AnyEvent->signal(signal => 'INT',  cb => \&terminate_server);
+	my @res;
+	foreach my $ch (unpack 'C*', $data) {
+		if ($key_ref->{pos} == scalar @{ $key_ref->{key} }) {
+			$key_ref->{pos} = 0;
+		}
+
+		push @res, $ch ^ $key_ref->{key}->[ $key_ref->{pos}++ ];
+	}
+
+	return pack 'C*', @res;
+}
 
 sub safe_destroy
 {
@@ -125,6 +148,21 @@ sub safe_destroy
 	return;
 }
 
+sub read_file
+{
+	open my $fh, '<', shift;
+	local $/;
+	return <$fh>;
+}
+
+##################################################
+my $cv = AnyEvent->condvar();
+$AnyEvent::Log::FILTER->level('debug');
+AnyEvent->signal(signal => 'TERM', cb => \&terminate_server);
+AnyEvent->signal(signal => 'QUIT', cb => \&terminate_server);
+AnyEvent->signal(signal => 'INT',  cb => \&terminate_server);
+
+sub terminate_server { $cv->send() }
 tcp_server(undef, $__port, sub {
 	my ($fh, $host, $port) = @_;
 
