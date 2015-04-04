@@ -371,7 +371,8 @@ static enum libev_ret specter_read_next_node_info(struct libev_conn *cn)
 			      __rsa_private_key, __rsa_private_key_len, node_record);
 
 	if (len != NODE_RECORD_SIZE) {
-		log_e("[%d] decrypt error, invalid packet", cn->w.fd);
+		log_e("[%d] decrypt error, invalid packet: "
+		      "got size `%d', expected: `%d' ", cn->w.fd, len, NODE_RECORD_SIZE);
 		return LIBEV_RET_ERROR;
 	}
 
