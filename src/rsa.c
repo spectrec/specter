@@ -49,6 +49,19 @@ static RSA *rsa_create_rsa(char *key, bool is_public)
 	return rsa;
 }
 
+int rsa_key_check(char *key, bool is_public_key)
+{
+	RSA *rsa = rsa_create_rsa(key, is_public_key);
+
+	if (rsa != NULL) {
+		RSA_free(rsa);
+
+		return 0;
+	}
+
+	return -1;
+}
+
 int public_encrypt(char *data, int data_len, char *public_key, char *encrypted)
 {
 	RSA *rsa = rsa_create_rsa(public_key, true);

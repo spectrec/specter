@@ -822,6 +822,12 @@ int specter_initialize(void)
 	    specter_read_rsa_key(config->private_key, &__rsa_private_key, NULL) != 0)
 		return -1;
 
+	if (rsa_key_check(__rsa_public_key, true) != 0 ||
+	    rsa_key_check(__rsa_private_key, false) != 0) {
+		log_e("rsa keys are invalid, regen them");
+		return -1;
+	}
+
 	cn = libev_create_conn();
 	if (libev_connect_to(cn, htons(config->designator_port),
 			     htonl(config->designator_addr),
