@@ -25,12 +25,10 @@ static void rsa_cleanup_bio(BIO **bio)
 		BIO_free(*bio);
 }
 
-static RSA *rsa_create_rsa(char *key, bool is_public)
+static RSA *rsa_create_rsa(char *key, int key_len, bool is_public)
 {
 	RSA *rsa = NULL;
 	BIO *bio __attribute__((cleanup(rsa_cleanup_bio))) = NULL;
-	int key_len = is_public == true ?
-		      PUBLIC_KEY_SIZE : PRIVATE_KEY_SIZE;
 
 	if ((bio = BIO_new_mem_buf(key, key_len)) == NULL) {
 		log_e("failed to create key BIO");
@@ -49,9 +47,9 @@ static RSA *rsa_create_rsa(char *key, bool is_public)
 	return rsa;
 }
 
-int rsa_key_check(char *key, bool is_public_key)
+int rsa_key_check(char *key, int len, bool is_public_key)
 {
-	RSA *rsa = rsa_create_rsa(key, is_public_key);
+	RSA *rsa = rsa_create_rsa(key, len, is_public_key);
 
 	if (rsa != NULL) {
 		RSA_free(rsa);
@@ -62,9 +60,10 @@ int rsa_key_check(char *key, bool is_public_key)
 	return -1;
 }
 
-int public_encrypt(char *data, int data_len, char *public_key, char *encrypted)
+int public_encrypt(char *data, int data_len, char *public_key,
+		   int key_len, char *encrypted)
 {
-	RSA *rsa = rsa_create_rsa(public_key, true);
+	RSA *rsa = rsa_create_rsa(public_key, key_len, true);
 	int ret;
 
 	if (rsa == NULL)
@@ -78,25 +77,10 @@ int public_encrypt(char *data, int data_len, char *public_key, char *encrypted)
 	return ret;
 }
 
-int public_decrypt(char *enc_data, int data_len, char *key, char *decrypted)
+int private_decrypt(char *enc_data, int data_len, char *key,
+		    int key_len, char *decrypted)
 {
-	RSA *rsa = rsa_create_rsa(key, false);
-	int ret;
-
-	if (rsa == NULL)
-		return -1;
-
-	assert(data_len <= RSA_MAX_SIZE_TO_DECRYPT(rsa));
-	ret = RSA_public_decrypt(data_len, (unsigned char *)enc_data,
-				 (unsigned char *)decrypted, rsa, padding);
-	RSA_free(rsa);
-
-	return ret;
-}
-
-int private_decrypt(char *enc_data, int data_len, char *key, char *decrypted)
-{
-	RSA *rsa = rsa_create_rsa(key, false);
+	RSA *rsa = rsa_create_rsa(key, key_len, false);
 	int ret;
 
 	if (rsa == NULL)
@@ -110,22 +94,6 @@ int private_decrypt(char *enc_data, int data_len, char *key, char *decrypted)
 	return ret;
 }
 
-
-int private_encrypt(char *data, int data_len, char *key, char *encrypted)
-{
-	RSA *rsa = rsa_create_rsa(key, false);
-	int ret;
-
-	if (rsa == NULL)
-		return -1;
-
-	assert(data_len < RSA_MAX_SIZE_TO_ENCRYPT(rsa));
-	ret = RSA_private_encrypt(data_len, (unsigned char *)data,
-				  (unsigned char *)encrypted, rsa, padding);
-	RSA_free(rsa);
-
-	return ret;
-}
 
 __attribute__((destructor))
 static void rsa_cleanup(void)

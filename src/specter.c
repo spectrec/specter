@@ -33,17 +33,20 @@ enum specter_flags {
 	SPECTER_FLAG_ENABLE_CIPHERING	= 2,
 };
 
+// XXX: 2048 bit's rsa key shoul be used
 #define PUBLIC_KEY_SIZE 451
+
 #define SESSION_KEY_SIZE 32
 
 #define ENCODED_NODE_RECORD_SIZE RSA_BLOCK_SIZE
 #define NODE_RECORD_SIZE (4 + 2 + 1 + SESSION_KEY_SIZE)
 
-#define ENCODED_DESIGNATOR_RECORD_SIZE 0
 #define DESIGNATOR_RESP_RECORD_SIZE (4 + 2 + PUBLIC_KEY_SIZE)
 
 static int __urandom_fd = -1;
 static uint32_t __rsa_public_key_len;
+static uint32_t __rsa_private_key_len;
+static uint32_t __rsa_designator_public_key_len;
 
 static char *__rsa_public_key;
 static char *__rsa_private_key;
@@ -364,7 +367,9 @@ static enum libev_ret specter_read_next_node_info(struct libev_conn *cn)
 	if (cn->rbuf.size < ENCODED_NODE_RECORD_SIZE)
 		return LIBEV_RET_OK;
 
-	len = private_decrypt(cn->rbuf.data, ENCODED_NODE_RECORD_SIZE, __rsa_private_key, node_record);
+	len = private_decrypt(cn->rbuf.data, ENCODED_NODE_RECORD_SIZE,
+			      __rsa_private_key, __rsa_private_key_len, node_record);
+
 	if (len != NODE_RECORD_SIZE) {
 		log_e("[%d] decrypt error, invalid packet", cn->w.fd);
 		return LIBEV_RET_ERROR;
@@ -480,7 +485,9 @@ static enum libev_ret specter_make_tunnel(struct libev_conn *root,
 	pack(r, &dest_port, sizeof(dest_port));
 	pack(r, &flags, sizeof(flags));
 
-	encoded_len = public_encrypt(pack_data(r), (int)pack_len(r), public_key, encoded_node_record);
+	encoded_len = public_encrypt(pack_data(r), (int)pack_len(r),
+				     public_key, PUBLIC_KEY_SIZE, encoded_node_record);
+
 	if (encoded_len != ENCODED_NODE_RECORD_SIZE) {
 		log_e("[%d] encrypt error, invalid encrypted size", root->w.fd);
 		return LIBEV_RET_ERROR;
@@ -506,7 +513,9 @@ static enum libev_ret specter_make_tunnel(struct libev_conn *root,
 		pack(r, port, sizeof(*port));
 		pack(r, &flags, sizeof(flags));
 
-		encoded_len = public_encrypt(pack_data(r), (int)pack_len(r), public_key, encoded_node_record);
+		encoded_len = public_encrypt(pack_data(r), (int)pack_len(r),
+					     public_key, PUBLIC_KEY_SIZE, encoded_node_record);
+
 		if (encoded_len != ENCODED_NODE_RECORD_SIZE) {
 			log_e("[%d] encrypt error, invalid encrypted size", root->w.fd);
 			return LIBEV_RET_ERROR;
@@ -643,8 +652,8 @@ static enum libev_ret specter_request_nodes_cb(struct libev_conn *designator_cn)
 		pack(p, &count, sizeof(count));
 		pack(p, session_key, SESSION_KEY_SIZE);
 
-		payload_len = public_encrypt(pack_data(p), pack_len(p),
-					     __rsa_designator_public_key, crypted_payload);
+		payload_len = public_encrypt(pack_data(p), pack_len(p), __rsa_designator_public_key,
+					     __rsa_designator_public_key_len, crypted_payload);
 		if (payload_len == -1)
 			return LIBEV_RET_ERROR;
 
@@ -716,6 +725,7 @@ static enum libev_ret libev_read_designator_pub_key_cb(struct libev_conn *cn)
 
 	assert(__rsa_designator_public_key == NULL);
 	__rsa_designator_public_key = strndup(public_key, key_len);
+	__rsa_designator_public_key_len = key_len;
 	assert(__rsa_designator_public_key != NULL);
 
 	return LIBEV_RET_CLOSE_CONN;
@@ -819,11 +829,11 @@ int specter_initialize(void)
 	struct libev_conn *cn;
 
 	if (specter_read_rsa_key(config->public_key, &__rsa_public_key, &__rsa_public_key_len) != 0 ||
-	    specter_read_rsa_key(config->private_key, &__rsa_private_key, NULL) != 0)
+	    specter_read_rsa_key(config->private_key, &__rsa_private_key, &__rsa_private_key_len) != 0)
 		return -1;
 
-	if (rsa_key_check(__rsa_public_key, true) != 0 ||
-	    rsa_key_check(__rsa_private_key, false) != 0) {
+	if (rsa_key_check(__rsa_public_key, __rsa_public_key_len, true) != 0 ||
+	    rsa_key_check(__rsa_private_key, __rsa_private_key_len, false) != 0) {
 		log_e("rsa keys are invalid, regen them");
 		return -1;
 	}
