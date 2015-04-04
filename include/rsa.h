@@ -1,6 +1,8 @@
 #ifndef __RSA_H__
 #define __RSA_H__
 
+#include <stdbool.h>
+
 #define RSA_BLOCK_SIZE 256
 
 int rsa_key_check(char *key, bool is_public_key);
