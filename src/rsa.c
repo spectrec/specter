@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <assert.h>
+#include <stdint.h>
 #include <stdbool.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
@@ -89,6 +90,13 @@ int private_decrypt(char *enc_data, int data_len, char *key,
 	assert(data_len <= RSA_MAX_SIZE_TO_DECRYPT(rsa));
 	ret = RSA_private_decrypt(data_len, (unsigned char *)enc_data,
 				  (unsigned char *)decrypted, rsa, padding);
+	if (ret == -1) {
+		uint32_t err = ERR_peek_last_error();
+		char *err_str = ERR_error_string(err, NULL);
+
+		log_e("decrypt failed: `%s'", err_str);
+	}
+
 	RSA_free(rsa);
 
 	return ret;
