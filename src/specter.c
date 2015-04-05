@@ -468,6 +468,14 @@ static enum libev_ret specter_make_tunnel(struct libev_conn *root,
 	ctx = root->ctx;
 	assert(ctx->type == CONTEXT_FOR_ROOT);
 
+	assert(ctx->root_node->keys != NULL);
+	for (uint16_t i = 0; i < config->tunnel_node_count; ++i) {
+		if (specter_generate_session_key(session_key, SESSION_KEY_SIZE) != LIBEV_RET_OK)
+			return LIBEV_RET_ERROR;
+
+		memcpy(ctx->root_node->keys[i].data, session_key, SESSION_KEY_SIZE);
+	}
+
 	unpack_init(r, ctx->root_node->data.data, ctx->root_node->data.size);
 	next_node_ip_p = unpack(r, sizeof(*next_node_ip_p));
 	next_node_port_p = unpack(r, sizeof(*next_node_port_p));
@@ -475,53 +483,37 @@ static enum libev_ret specter_make_tunnel(struct libev_conn *root,
 	assert(next_node_ip_p != NULL && next_node_port_p != NULL && public_key != NULL);
 
 	sbuf_init(&req);
-	assert(ctx->root_node->keys != NULL);
-	if (specter_generate_session_key(session_key, SESSION_KEY_SIZE) != LIBEV_RET_OK)
-		return LIBEV_RET_ERROR;
-	memcpy(ctx->root_node->keys[0].data, session_key, SESSION_KEY_SIZE);
-
-	pack_init(r, node_record, sizeof(node_record));
-	pack(r, session_key, SESSION_KEY_SIZE);
-	pack(r, &dest_ip, sizeof(dest_ip));
-	pack(r, &dest_port, sizeof(dest_port));
-	pack(r, &flags, sizeof(flags));
-
-	encoded_len = public_encrypt(pack_data(r), (int)pack_len(r),
-				     public_key, PUBLIC_KEY_SIZE, encoded_node_record);
-
-	if (encoded_len != ENCODED_NODE_RECORD_SIZE) {
-		log_e("[%d] encrypt error, invalid encrypted size", root->w.fd);
-		return LIBEV_RET_ERROR;
-	}
-	sbuf_append(&req, encoded_node_record, encoded_len);
-
-	for (uint16_t i = 1; i < config->tunnel_node_count; ++i) {
-		uint32_t *ip = unpack(r, sizeof(*ip));
-		uint16_t *port = unpack(r, sizeof(*port));
-		uint8_t flags = SPECTER_FLAG_NONE;
-		char *public_key = unpack(r, PUBLIC_KEY_SIZE);
-
-		assert(ip != NULL && port != NULL && public_key != NULL);
-		if (specter_generate_session_key(session_key, SESSION_KEY_SIZE) != LIBEV_RET_OK) {
-			sbuf_delete(&req);
-			return LIBEV_RET_ERROR;
-		}
-		memcpy(ctx->root_node->keys[i].data, session_key, SESSION_KEY_SIZE);
+	for (int16_t i = config->tunnel_node_count - 1; i >= 0; --i) {
+		uint16_t port = dest_port;
+		uint32_t ip = dest_ip;
 
 		pack_init(r, node_record, sizeof(node_record));
-		pack(r, session_key, SESSION_KEY_SIZE);
-		pack(r, ip, sizeof(*ip));
-		pack(r, port, sizeof(*port));
+		pack(r, ctx->root_node->keys[i].data, SESSION_KEY_SIZE);
+		pack(r, &ip, sizeof(ip));
+		pack(r, &port, sizeof(port));
 		pack(r, &flags, sizeof(flags));
 
 		encoded_len = public_encrypt(pack_data(r), (int)pack_len(r),
 					     public_key, PUBLIC_KEY_SIZE, encoded_node_record);
-
 		if (encoded_len != ENCODED_NODE_RECORD_SIZE) {
 			log_e("[%d] encrypt error, invalid encrypted size", root->w.fd);
+			sbuf_delete(&req);
+
 			return LIBEV_RET_ERROR;
 		}
 		sbuf_unshift(&req, encoded_node_record, encoded_len);
+
+		dest_port = *next_node_port_p;
+		dest_ip = *next_node_ip_p;
+		flags = SPECTER_FLAG_NONE;
+
+		if (i > 0) {
+			// In case `i == 0' -- all data has been unpacked
+			next_node_ip_p = unpack(r, sizeof(*next_node_ip_p));
+			next_node_port_p = unpack(r, sizeof(*next_node_port_p));
+			public_key = unpack(r, PUBLIC_KEY_SIZE);
+			assert(next_node_ip_p != NULL && next_node_port_p != NULL && public_key != NULL);
+		}
 	}
 
 	next_node_ip = *next_node_ip_p;
