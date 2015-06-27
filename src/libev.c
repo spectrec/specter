@@ -458,6 +458,7 @@ static void libev_timer_cb(EV_P_ ev_timer *t)
 
 	switch (lt->cb(lt, lt->ctx)) {
 	case LIBEV_TIMER_RET_CONT:
+		libev_timer_start(lt);
 		break;
 	case LIBEV_TIMER_RET_STOP:
 		libev_timer_stop(lt);
@@ -485,6 +486,14 @@ struct libev_timer *libev_timer_create(float interval, float delay,
 
 void libev_timer_start(struct libev_timer *t)
 {
+	uint32_t delay;
+	float after;
+
+	delay = (uint32_t)(t->delay * 1e6); // msecs
+	after = t->interval + (rand() % delay) / 1e6f;
+
+	ev_timer_stop(__loop, &t->t);
+	ev_timer_set(&t->t, after, 0.);
 	ev_timer_start(__loop, &t->t);
 }
 

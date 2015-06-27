@@ -289,17 +289,6 @@ static void specter_decode_with_session_key(struct specter_context *ctx,
 	specter_encode_data(&ctx->node->key, data, size);
 }
 
-static enum libev_timer_ret specter_send_fake_packet_cb(struct libev_timer *t, void *ctx)
-{
-	struct libev_conn *cn = ctx;
-
-	// FIXME
-	(void)t;
-	(void)cn;
-
-	return LIBEV_TIMER_RET_CONT;
-}
-
 static enum libev_ret specter_decode_and_pass_to_chain(struct libev_conn *cn)
 {
 	struct specter_context *ctx = cn->ctx;
@@ -380,6 +369,32 @@ static enum libev_ret specter_encode_and_pass_to_chain(struct libev_conn *cn)
 	sbuf_reset(&cn->rbuf);
 
 	return LIBEV_RET_OK;
+}
+
+static enum libev_timer_ret specter_send_fake_packet_cb(struct libev_timer *t __attribute__((unused)),
+							void *timer_ctx)
+{
+	struct libev_conn *cn = timer_ctx;
+	struct specter_context *ctx = cn->ctx;
+	uint32_t packet_size = 0;
+	char buf[MESSAGE_SIZE];
+
+	pack_init(r, buf, sizeof(buf));
+	pack(r, &packet_size, sizeof(packet_size));
+	{
+		char rand_buf[PAYLOAD_SIZE];
+
+		if (specter_get_random_data(rand_buf, PAYLOAD_SIZE) != LIBEV_RET_OK)
+			return LIBEV_RET_ERROR;
+
+		pack(r, rand_buf, PAYLOAD_SIZE);
+	}
+
+	log_i("send fake message");
+	specter_encode_with_session_key(cn->ctx, pack_data(r), pack_len(r));
+	libev_send(ctx->node->host, pack_data(r), pack_len(r));
+
+	return LIBEV_TIMER_RET_CONT;
 }
 
 static enum libev_ret specter_pass_to_client(struct libev_conn *cn)
@@ -534,6 +549,7 @@ static enum libev_ret specter_connected_to_chain_cb(struct libev_conn *node_cn)
 	node_cn->read_cb = specter_pass_to_client;
 	libev_conn_on_read(node_cn);
 
+	libev_timer_start(client_ctx->root_node->timer);
 	client_cn->read_cb = specter_encode_and_pass_to_chain;
 	libev_conn_on_read(client_cn);
 
