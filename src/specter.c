@@ -43,6 +43,9 @@ enum specter_flags {
 
 #define DESIGNATOR_RESP_RECORD_SIZE (4 + 2 + PUBLIC_KEY_SIZE)
 
+#define PAYLOAD_SIZE 256
+#define MESSAGE_SIZE (4 + PAYLOAD_SIZE)
+
 static int __urandom_fd = -1;
 static uint32_t __rsa_public_key_len;
 static uint32_t __rsa_private_key_len;
@@ -51,17 +54,6 @@ static uint32_t __rsa_designator_public_key_len;
 static char *__rsa_public_key;
 static char *__rsa_private_key;
 static char *__rsa_designator_public_key;
-
-__attribute__((destructor))
-static void specter_cleanup(void)
-{
-	if (__urandom_fd != -1)
-		(void)close(__urandom_fd);
-
-	free(__rsa_public_key);
-	free(__rsa_private_key);
-	free(__rsa_designator_public_key);
-}
 
 struct session_key {
 	uint8_t data[SESSION_KEY_SIZE];
@@ -86,13 +78,27 @@ struct specter_context {
 
 		struct {
 			struct libev_conn *next_node;
+			struct libev_timer *timer;
 			struct session_key* keys;
 			struct sbuf data;
 		} *root_node;
 	};
 };
 
-static enum libev_ret specter_generate_session_key(char *buf, ssize_t key_len)
+static enum libev_timer_ret specter_send_fake_packet_cb(struct libev_timer *t, void *ctx);
+
+__attribute__((destructor))
+static void specter_cleanup(void)
+{
+	if (__urandom_fd != -1)
+		(void)close(__urandom_fd);
+
+	free(__rsa_public_key);
+	free(__rsa_private_key);
+	free(__rsa_designator_public_key);
+}
+
+static enum libev_ret specter_get_random_data(char *buf, ssize_t key_len)
 {
 	if (__urandom_fd == -1)
 		__urandom_fd = open("/dev/urandom", O_RDONLY);
@@ -113,6 +119,11 @@ static enum libev_ret specter_generate_session_key(char *buf, ssize_t key_len)
 	return LIBEV_RET_OK;
 }
 
+static enum libev_ret specter_generate_session_key(char *buf, ssize_t len)
+{
+	return specter_get_random_data(buf, len);
+}
+
 static enum libev_ret specter_conn_destroy(struct libev_conn *cn)
 {
 	struct specter_context *ctx;
@@ -125,22 +136,29 @@ static enum libev_ret specter_conn_destroy(struct libev_conn *cn)
 		break;
 	case CONTEXT_FOR_DESIGNATOR:
 		pair_cn = ctx->designator->client;
+
 		free(ctx->designator);
 		ctx->designator = NULL;
 
 		break;
 	case CONTEXT_FOR_NODE:
 		pair_cn = ctx->node->host;
+
 		free(ctx->node);
 		ctx->node = NULL;
 
 		break;
 	case CONTEXT_FOR_ROOT:
 		pair_cn = ctx->root_node->next_node;
+
 		free(ctx->root_node->keys);
 		ctx->root_node->keys = NULL;
 
+		libev_timer_destroy(ctx->root_node->timer);
+		ctx->root_node->timer = NULL;
+
 		sbuf_delete(&ctx->root_node->data);
+
 		free(ctx->root_node);
 		ctx->root_node = NULL;
 
@@ -178,7 +196,7 @@ static enum libev_ret specter_conn_destroy(struct libev_conn *cn)
 	return LIBEV_RET_OK;
 }
 
-static struct specter_context *specter_create_context_for(enum specter_context_for type)
+static struct specter_context *specter_create_context_for(struct libev_conn *cn, enum specter_context_for type)
 {
 	struct config *config = config_get();
 	struct specter_context *ctx;
@@ -206,6 +224,10 @@ static struct specter_context *specter_create_context_for(enum specter_context_f
 					      sizeof(struct session_key));
 		assert(ctx->root_node->keys != NULL);
 		sbuf_init(&ctx->root_node->data);
+
+		ctx->root_node->timer = libev_timer_create(config->fake_packet_interval,
+							   config->send_delay, specter_send_fake_packet_cb, cn);
+		assert(ctx->root_node->timer != NULL);
 		break;
 	default:
 		abort();
@@ -267,6 +289,17 @@ static void specter_decode_with_session_key(struct specter_context *ctx,
 	specter_encode_data(&ctx->node->key, data, size);
 }
 
+static enum libev_timer_ret specter_send_fake_packet_cb(struct libev_timer *t, void *ctx)
+{
+	struct libev_conn *cn = ctx;
+
+	// FIXME
+	(void)t;
+	(void)cn;
+
+	return LIBEV_TIMER_RET_CONT;
+}
+
 static enum libev_ret specter_decode_and_pass_to_chain(struct libev_conn *cn)
 {
 	struct specter_context *ctx = cn->ctx;
@@ -274,8 +307,39 @@ static enum libev_ret specter_decode_and_pass_to_chain(struct libev_conn *cn)
 	assert(ctx->type == CONTEXT_FOR_NODE);
 	if ((ctx->node->flags & SPECTER_FLAG_ENABLE_CIPHERING) != 0)
 		specter_decode_with_session_key(ctx, cn->rbuf.data, cn->rbuf.size);
-	libev_send(ctx->node->host, cn->rbuf.data, cn->rbuf.size);
-	sbuf_reset(&cn->rbuf);
+
+	if ((ctx->node->flags & SPECTER_FLAG_EXIT_NODE) == 0) {
+		libev_send(ctx->node->host, cn->rbuf.data, cn->rbuf.size);
+		sbuf_reset(&cn->rbuf);
+
+		return LIBEV_RET_OK;
+	}
+
+	// This is exit node
+	for (size_t len = cn->rbuf.size; len > 0; len -= MESSAGE_SIZE) {
+		const char *payload;
+		uint32_t *msg_len;
+
+		if (len < MESSAGE_SIZE)
+			// this message not fully read
+			return LIBEV_RET_OK;
+
+		unpack_init(msg, cn->rbuf.data, MESSAGE_SIZE);
+		msg_len = unpack(msg, sizeof(*msg_len));
+		assert(msg_len != NULL);
+
+		if (*msg_len != 0) {
+			payload = unpack(msg, *msg_len);
+			if (payload == NULL) {
+				log_e("invalid packet received (msg len `%u'", *msg_len);
+				return LIBEV_RET_ERROR;
+			}
+
+			libev_send(ctx->node->host, payload, *msg_len);
+		} // else -- this is fake message
+
+		sbuf_shrink(&cn->rbuf, MESSAGE_SIZE);
+	}
 
 	return LIBEV_RET_OK;
 }
@@ -283,10 +347,36 @@ static enum libev_ret specter_decode_and_pass_to_chain(struct libev_conn *cn)
 static enum libev_ret specter_encode_and_pass_to_chain(struct libev_conn *cn)
 {
 	struct specter_context *ctx = cn->ctx;
+	const char *data = cn->rbuf.data;
+	size_t data_len = cn->rbuf.size;
+	char buf[MESSAGE_SIZE];
 
 	assert(ctx->type == CONTEXT_FOR_ROOT);
-	specter_encode_with_session_key(ctx, cn->rbuf.data, cn->rbuf.size);
-	libev_send(ctx->node->host, cn->rbuf.data, cn->rbuf.size);
+	while (data_len > 0) {
+		uint32_t packet_size = data_len < PAYLOAD_SIZE
+				     ? data_len : PAYLOAD_SIZE;
+
+		pack_init(r, buf, sizeof(buf));
+		pack(r, &packet_size, sizeof(packet_size));
+		pack(r, data, packet_size);
+		if (packet_size < PAYLOAD_SIZE) {
+			size_t left = PAYLOAD_SIZE - packet_size;
+			char rand_buf[left];
+
+			if (specter_get_random_data(rand_buf, left) != LIBEV_RET_OK)
+				return LIBEV_RET_ERROR;
+
+			log_i("append `%zu' bytes of random data", left);
+			pack(r, rand_buf, left);
+		}
+
+		specter_encode_with_session_key(ctx, pack_data(r), pack_len(r));
+		libev_send(ctx->node->host, pack_data(r), pack_len(r));
+
+		data_len -= packet_size;
+		data += packet_size;
+	}
+
 	sbuf_reset(&cn->rbuf);
 
 	return LIBEV_RET_OK;
@@ -384,11 +474,11 @@ static enum libev_ret specter_read_next_node_info(struct libev_conn *cn)
 	assert(session_key != NULL && ip != NULL && port != NULL && flags != NULL);
 
 	next_node_cn = libev_create_conn();
-	next_node_ctx = specter_create_context_for(CONTEXT_FOR_NEXT_NODE);
+	next_node_ctx = specter_create_context_for(NULL, CONTEXT_FOR_NEXT_NODE);
 	next_node_ctx->client = cn;
 	specter_set_ctx(next_node_cn, next_node_ctx);
 
-	ctx = specter_create_context_for(CONTEXT_FOR_NODE);
+	ctx = specter_create_context_for(NULL, CONTEXT_FOR_NODE);
 	ctx->node->host = next_node_cn;
 	ctx->node->flags = *flags;
 	memcpy(ctx->node->key.data, session_key, SESSION_KEY_SIZE);
@@ -521,7 +611,7 @@ static enum libev_ret specter_make_tunnel(struct libev_conn *root,
 	next_node_port = *next_node_port_p;
 
 	next_node_cn = libev_create_conn();
-	next_node_ctx = specter_create_context_for(CONTEXT_FOR_NEXT_NODE);
+	next_node_ctx = specter_create_context_for(NULL, CONTEXT_FOR_NEXT_NODE);
 	next_node_ctx->client = root;
 	specter_set_ctx(next_node_cn, next_node_ctx);
 
@@ -680,11 +770,11 @@ static enum libev_ret specter_accept_new_client_cb(struct libev_conn *listen_cn)
 		return LIBEV_RET_OK;
 
 	designator_cn = libev_create_conn();
-	ctx = specter_create_context_for(CONTEXT_FOR_DESIGNATOR);
+	ctx = specter_create_context_for(NULL, CONTEXT_FOR_DESIGNATOR);
 	ctx->designator->client = cn;
 	specter_set_ctx(designator_cn, ctx);
 
-	client_ctx = specter_create_context_for(CONTEXT_FOR_ROOT);
+	client_ctx = specter_create_context_for(cn, CONTEXT_FOR_ROOT);
 	client_ctx->root_node->next_node = designator_cn;
 	specter_set_ctx(cn, client_ctx);
 
