@@ -20,6 +20,8 @@ struct config {
 
 	float node_connect_timeout;
 	float designator_connect_timeout;
+	float fake_packet_interval;
+	float send_delay;
 
 	uint16_t tunnel_node_count;
 };

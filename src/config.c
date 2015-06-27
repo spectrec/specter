@@ -94,6 +94,10 @@ static int config_store_value(const char *key, const char *value)
 		__config.node_connect_timeout = (float)convert_str_to_float(value);
 	} else if (strcmp(key, "designator_connect_timeout") == 0) {
 		__config.designator_connect_timeout = (float)convert_str_to_float(value);
+	} else if (strcmp(key, "fake_packet_interval") == 0) {
+		__config.fake_packet_interval = (float)convert_str_to_float(value);
+	} else if (strcmp(key, "send_delay") == 0) {
+		__config.send_delay = (float)convert_str_to_float(value);
 	} else {
 		fprintf(stderr, "unknown key `%s'", key);
 

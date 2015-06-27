@@ -1,3 +1,4 @@
+#include <time.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -124,9 +125,10 @@ static void libev_write_cb(EV_P_ ev_io *w, int revent)
 		sbuf_shrink(&lc->wbuf, ret);
 	}
 
-	if (lc->wbuf.size == 0)
+	if (lc->wbuf.size == 0) {
 		libev_conn_off_write(lc);
-	else if ((w->events & EV_WRITE) == 0)
+		ev_timer_stop(EV_A_ &lc->dt);
+	} else if ((w->events & EV_WRITE) == 0)
 		// It may be possible, if called from `libev_send()'
 		libev_conn_on_write(lc);
 
@@ -325,6 +327,14 @@ enum libev_ret libev_bind_listen_tcp_socket(uint16_t port, uint32_t addr,
 	return 0;
 }
 
+static void libev_conn_delay_timer_cb(EV_P_ ev_timer *t)
+{
+	struct libev_conn *cn = LIBEV_CONN(t, dt);
+
+	if (cn->wbuf.size != 0)
+		libev_write_cb(EV_A_ &cn->w, EV_WRITE);
+}
+
 struct libev_conn *libev_create_conn(void)
 {
 	struct libev_conn *cn;
@@ -340,6 +350,8 @@ struct libev_conn *libev_create_conn(void)
 	ev_cleanup_init(&cn->gc, libev_cleanup_cb);
 	ev_cleanup_start(__loop, &cn->gc);
 
+	ev_timer_init(&cn->dt, libev_conn_delay_timer_cb, 0, 0);
+
 	return cn;
 }
 
@@ -353,11 +365,14 @@ void libev_cleanup_conn(struct libev_conn *lc)
 
 	ev_io_stop(__loop, &lc->w);
 	ev_timer_stop(__loop, &lc->t);
+	ev_timer_stop(__loop, &lc->dt);
 	ev_cleanup_stop(__loop, &lc->gc);
 
 	if (lc->ctx != NULL) {
 		assert(lc->destroy_cb != NULL);
 		lc->destroy_cb(lc);
+
+		assert(lc->ctx == NULL);
 	}
 
 	sbuf_delete(&lc->rbuf);
@@ -374,20 +389,19 @@ enum libev_ret libev_connect_to(struct libev_conn *cn, uint16_t port,
 	struct sockaddr_in sa;
 	int fd;
 
-	fd = socket(AF_INET, SOCK_STREAM, 0);
+	if ((fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+		log_e("can't create socket: %s", strerror(errno));
+		libev_cleanup_conn(cn);
+
+		return LIBEV_RET_ERROR;
+	}
+
 	ev_io_init(&cn->w, libev_cb, fd, EV_WRITE);
 	ev_io_start(__loop, &cn->w);
 
 	cn->timeout_cb = timeout_cb;
 	ev_timer_init(&cn->t, libev_timeout_cb, timeout, 0.);
 	ev_timer_start(__loop, &cn->t);
-
-	if (fd < 0) {
-		log_e("can't create socket: %s", strerror(errno));
-		libev_cleanup_conn(cn);
-
-		return LIBEV_RET_ERROR;
-	}
 
 	if (libev_set_socket_nonblock(fd) != 0) {
 		libev_cleanup_conn(cn);
@@ -436,10 +450,60 @@ static void libev_init_signal_handlers()
 	ev_signal_start(__loop, &__sigquit_watcher);
 }
 
+static void libev_timer_cb(EV_P_ ev_timer *t)
+{
+	struct libev_timer *lt = (struct libev_timer *)((void *)t - offsetof(struct libev_timer, t));
+
+	(void)loop;
+
+	switch (lt->cb(lt, lt->ctx)) {
+	case LIBEV_TIMER_RET_CONT:
+		break;
+	case LIBEV_TIMER_RET_STOP:
+		libev_timer_stop(lt);
+		break;
+	default:
+		abort();
+	}
+}
+
+struct libev_timer *libev_timer_create(float interval, float delay,
+				       libev_timer_cb_t cb, void *ctx)
+{
+	struct libev_timer *t;
+
+	t = calloc(1, sizeof(*t));
+	t->interval = interval;
+	t->delay = delay;
+	t->ctx = ctx;
+	t->cb = cb;
+
+	ev_timer_init(&t->t, libev_timer_cb, interval, 0);
+
+	return t;
+}
+
+void libev_timer_start(struct libev_timer *t)
+{
+	ev_timer_start(__loop, &t->t);
+}
+
+void libev_timer_stop(struct libev_timer *t)
+{
+	ev_timer_stop(__loop, &t->t);
+}
+
+void libev_timer_destroy(struct libev_timer *t)
+{
+	libev_timer_stop(t);
+	free(t);
+}
+
 int libev_initialize()
 {
 	__loop = EV_DEFAULT;
 	libev_init_signal_handlers();
+	srand((unsigned)time(NULL));
 
 	return 0;
 }
@@ -456,8 +520,21 @@ void libev_stop()
 
 void libev_send(struct libev_conn *cn, const void *data, size_t size)
 {
-	sbuf_append(&cn->wbuf, data, size);
+	struct config *conf;
+	uint32_t delay;
+	float after;
 
-	// Try to send immidiatly
-	libev_write_cb(__loop, &cn->w, EV_WRITE);
+	sbuf_append(&cn->wbuf, data, size);
+	libev_conn_on_write(cn);
+
+	if (ev_is_active(&cn->dt) == true || ev_is_pending(&cn->dt) == true)
+		// Timer is already activated
+		return;
+
+	conf = config_get();
+	delay = (uint32_t)(conf->send_delay * 1e6); // msecs
+	after = (rand() % delay) / 1e6f;
+
+	ev_timer_set(&cn->dt, after, 0.);
+	ev_timer_start(__loop, &cn->dt);
 }

@@ -398,7 +398,8 @@ static enum libev_ret specter_read_next_node_info(struct libev_conn *cn)
 			     specter_node_connected_to_next_node,
 			     config->node_connect_timeout,
 			     specter_timeout_cb) != LIBEV_RET_OK)
-		return LIBEV_RET_ERROR;
+		// Return ok to avoid double free inside after failed `read_cb'
+		return LIBEV_RET_OK;
 
 	sbuf_shrink(&cn->rbuf, ENCODED_NODE_RECORD_SIZE);
 	cn->read_cb = NULL;
@@ -533,7 +534,9 @@ static enum libev_ret specter_make_tunnel(struct libev_conn *root,
 			     specter_connected_to_chain_cb,
 			     config->node_connect_timeout,
 			     specter_timeout_cb) != LIBEV_RET_OK)
-		return LIBEV_RET_ERROR;
+		// Return ok to avoid double free,
+		// because clien conn is already free'd.
+		return LIBEV_RET_OK;
 
 	return LIBEV_RET_OK;
 }
@@ -692,7 +695,8 @@ static enum libev_ret specter_accept_new_client_cb(struct libev_conn *listen_cn)
 			     specter_request_nodes_cb,
 			     config->designator_connect_timeout,
 			     specter_timeout_cb) != LIBEV_RET_OK)
-		return LIBEV_RET_ERROR;
+		// Retrun ok, because connection has been destroyed
+		return LIBEV_RET_OK;
 
 	return LIBEV_RET_OK;
 }
