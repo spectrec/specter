@@ -4,3 +4,4 @@
 specter
 tags
 *.pem
+*.pid
