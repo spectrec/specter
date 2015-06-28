@@ -838,11 +838,12 @@ static enum libev_ret specter_accept_new_client_cb(struct libev_conn *listen_cn)
 
 static enum libev_ret specter_udp_parser_cb(struct libev_conn *cn)
 {
+	struct config *config = config_get();
 	char buf[UDP_MESSAGE_SIZE];
 	struct sockaddr_in sa;
 	socklen_t len = sizeof(sa);
-	ssize_t size;
 	uint8_t *cmd;
+	ssize_t size;
 
 	if ((size = recvfrom(cn->w.fd, buf, sizeof(buf), 0, (struct sockaddr *)&sa, &len)) < 0) {
 		if (errno == EWOULDBLOCK)
@@ -859,14 +860,19 @@ static enum libev_ret specter_udp_parser_cb(struct libev_conn *cn)
 		log_e("can't unpack udp command");
 		return LIBEV_RET_ERROR;
 	}
+	log_d("got new udp request `%u'", *cmd);
 
 	switch (*cmd) {
 	case SPECTER_UDP_COMMAND_PING: {
+		uint32_t host = htonl(config->listen_node_addr);
+		uint16_t port = htons(config->listen_node_port);
 		uint8_t pong = SPECTER_UDP_RESPONSE_PONG;
-		char resp[2];
+		char resp[8];
 
 		pack_init(r, resp, sizeof(resp));
 		pack(r, &pong, sizeof(pong));
+		pack(r, &host, sizeof(host));
+		pack(r, &port, sizeof(port));
 
 		if (sendto(cn->w.fd, pack_data(r), pack_len(r), 0, (struct sockaddr *)&sa, len) < 0) {
 			log_e("sendto failed: %s", strerror(errno));
@@ -876,24 +882,20 @@ static enum libev_ret specter_udp_parser_cb(struct libev_conn *cn)
 		break;
 	}
 	case SPECTER_UDP_COMMAND_PUT: {
-		struct config *config = config_get();
 		struct libev_conn *cn;
 
 		if (__searching_designator == true) {
 			__searching_designator = false;
 			__designator_addr = sa;
 
-			cn = libev_create_conn();
 			libev_timer_stop(__timer);
-
-			assert(__rsa_designator_public_key == NULL);
-			return libev_connect_to(cn, sa.sin_port, sa.sin_addr.s_addr,
-						libev_continue_init_cb,
-						config->designator_connect_timeout,
-						specter_timeout_break_all_cb);
 		}
 
-		break;
+		cn = libev_create_conn();
+		return libev_connect_to(cn, sa.sin_port, sa.sin_addr.s_addr,
+					libev_continue_init_cb,
+					config->designator_connect_timeout,
+					specter_timeout_break_all_cb);
 	}
 	default:
 		log_w("unknown udp command: `%u'", *cmd);
@@ -1028,6 +1030,7 @@ static int specter_search_designator(void)
 {
 	struct config *conf = config_get();
 	uint8_t command = DESIGNATOR_UDP_COMMAND_GET;
+	uint16_t resp_port = htons(conf->listen_node_port);
 	char req[8];
 
 	assert(__searching_designator == false);
@@ -1041,6 +1044,7 @@ static int specter_search_designator(void)
 	__searching_designator = true;
 	pack_init(r, req, sizeof(req));
 	pack(r, &command, sizeof(command));
+	pack(r, &resp_port, sizeof(resp_port));
 
 	if (__timer == NULL)
 		__timer = libev_timer_create(conf->designator_connect_timeout, 0.,

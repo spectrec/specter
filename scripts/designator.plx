@@ -6,19 +6,24 @@ use Socket;
 use AnyEvent;
 use Data::Dumper;
 use AnyEvent::Log;
+use IO::Socket::INET;
 use AnyEvent::Socket;
 use AnyEvent::Handle;
 use Crypt::OpenSSL::RSA;
+use AnyEvent::Handle::UDP;
 
 use autodie qw(:all);
 use Scalar::Util qw(refaddr);
 
-sub CMD_PUT() { 1 }
-sub CMD_GET() { 2 }
+sub CMD_PUT()      { 1 }
+sub CMD_GET()      { 2 }
+sub CMD_UDP_GET()  { 3 }
+sub CMD_UDP_PONG() { 1 }
 
-sub RSA_BLOCK_SIZE {}
+sub SPECTER_CMD_PING() { 1 }
+sub SPECTER_CMD_PUT()  { 2 }
 
-sub PING_EACH() { 5 } # seconds
+sub PING_EACH()   { 5 } # seconds
 
 my $__port = 5432;
 my $public_key = read_file('public.pem');
@@ -64,20 +69,28 @@ my %HANDLERS = (
 					my $text_ip = format_address $host;
 
 					AE::log debug => "timer called $text_ip:$port_p";
-					tcp_connect $text_ip, $port_p, sub {
-						my $fh = shift;
+					if ($SERVERS_INFO{ $host . $port }->{ping}) {
+						delete $SERVERS_INFO{ $host . $port };
+						AE::log debug => 'server has gone';
 
-						if (not $fh) {
-							delete $SERVERS_INFO{ $host . $port };
-							AE::log debug => 'server has gone';
+						return;
+					} else {
+						AE::log debug => "server `$text_ip:$port_p' is alive";
+					}
 
-							return;
-						}
+					my $udp = IO::Socket::INET->new(
+						PeerPort  => $port_p,
+						PeerAddr  => $text_ip,
+						Proto     => 'udp',
+						LocalAddr => 'localhost',
+						LocalPort => $__port,
+						ReusePort => 1,
+						ReuseAddr => 1,
+					);
 
-						AE::log debug => 'server is alive';
-
-						close $fh;
-					};
+					AE::log debug => 'send ping request';
+					$udp->send(pack('C', SPECTER_CMD_PING()));
+					$SERVERS_INFO{ $host . $port }->{ping} = 1;
 				}
 			);
 
@@ -195,5 +208,47 @@ tcp_server(undef, $__port, sub {
 
 	$AE_HANDLES{ refaddr $handle } = $handle;
 });
+
+my $echo_server = AnyEvent::Handle::UDP->new(
+	family  => 4,
+	bind    => ['0.0.0.0', $__port],
+	on_recv => sub {
+		my ($data, $ae_handle, $client_addr) = @_;
+
+		my ($req, $resp_port) = unpack 'Cn', $data;
+		if ($req == CMD_UDP_GET()) {
+			my ($port, $ip) = unpack_sockaddr_in($client_addr);
+			my $host = inet_ntoa($ip);
+			AE::log info => "got udp request `$req' from `$host:$port'";
+
+			my $resp = pack('C', SPECTER_CMD_PUT());
+			$client_addr = pack_sockaddr_in($resp_port, $ip);
+			$ae_handle->push_send($resp, $client_addr);
+		} elsif ($req == CMD_UDP_PONG()) {
+			my (undef, $host, $port) = unpack 'CNn', $data;
+
+			$host = pack('N', $host);
+			$port = pack('n', $port);
+			$SERVERS_INFO{ $host . $port }->{ping} = 0;
+
+			AE::log debug => "got udp response `$req'";
+		} else {
+			AE::log error => "unknown request: `$req'";
+		}
+	},
+);
+
+my $broadcast = IO::Socket::INET->new(
+	PeerPort  => 2346,
+	PeerAddr  => inet_ntoa(INADDR_BROADCAST),
+	Proto     => 'udp',
+	LocalAddr => 'localhost',
+	LocalPort => $__port,
+	Broadcast => 1,
+	ReusePort => 1,
+	ReuseAddr => 1,
+);
+$broadcast->send(pack('C', SPECTER_CMD_PUT()));
+undef $broadcast;
 
 $cv->recv();
