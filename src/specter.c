@@ -18,6 +18,8 @@
 enum designator_command {
 	DESIGNATOR_COMMAND_PUT = 1,
 	DESIGNATOR_COMMAND_GET = 2,
+
+	DESIGNATOR_UDP_COMMAND_GET = 3, // search designator
 };
 
 enum specter_context_for {
@@ -33,6 +35,15 @@ enum specter_flags {
 	SPECTER_FLAG_ENABLE_CIPHERING	= 2,
 };
 
+enum specter_udp_command {
+	SPECTER_UDP_COMMAND_PING	= 1,
+	SPECTER_UDP_COMMAND_PUT		= 2, // store designator address
+};
+
+enum specter_udp_response {
+	SPECTER_UDP_RESPONSE_PONG	= 1,
+};
+
 // XXX: 2048 bit's rsa key shoul be used
 #define PUBLIC_KEY_SIZE 451
 
@@ -46,6 +57,8 @@ enum specter_flags {
 #define PAYLOAD_SIZE 256
 #define MESSAGE_SIZE (4 + PAYLOAD_SIZE)
 
+#define UDP_MESSAGE_SIZE 1500 // default MTU
+
 static int __urandom_fd = -1;
 static uint32_t __rsa_public_key_len;
 static uint32_t __rsa_private_key_len;
@@ -54,6 +67,11 @@ static uint32_t __rsa_designator_public_key_len;
 static char *__rsa_public_key;
 static char *__rsa_private_key;
 static char *__rsa_designator_public_key;
+
+static struct libev_timer *__timer;
+
+static bool __searching_designator;
+static struct sockaddr_in __designator_addr;
 
 struct session_key {
 	uint8_t data[SESSION_KEY_SIZE];
@@ -86,12 +104,17 @@ struct specter_context {
 };
 
 static enum libev_timer_ret specter_send_fake_packet_cb(struct libev_timer *t, void *ctx);
+static enum libev_ret libev_continue_init_cb(struct libev_conn *cn);
+static int specter_search_designator(void);
 
 __attribute__((destructor))
 static void specter_cleanup(void)
 {
 	if (__urandom_fd != -1)
 		(void)close(__urandom_fd);
+
+	if (__timer != NULL)
+		libev_timer_destroy(__timer);
 
 	free(__rsa_public_key);
 	free(__rsa_private_key);
@@ -734,8 +757,10 @@ static enum libev_ret specter_request_nodes_cb(struct libev_conn *designator_cn)
 
 	designator_cn->write_cb = NULL;
 	libev_conn_off_timer(designator_cn);
-	if (libev_socket_error_occurred(designator_cn->w.fd) != 0)
+	if (libev_socket_error_occurred(designator_cn->w.fd) != 0) {
+		specter_search_designator();
 		return LIBEV_RET_ERROR;
+	}
 
 	{
 		char buf[512] = {0};
@@ -780,6 +805,10 @@ static enum libev_ret specter_accept_new_client_cb(struct libev_conn *listen_cn)
 	struct libev_conn *designator_cn;
 	struct libev_conn *cn;
 
+	if (__rsa_designator_public_key == NULL)
+		// Don't accept new clients in case we haven't designator
+		return LIBEV_RET_OK;
+
 	cn = libev_accept(listen_cn);
 	if (cn == NULL)
 		// ignore fails
@@ -807,10 +836,81 @@ static enum libev_ret specter_accept_new_client_cb(struct libev_conn *listen_cn)
 	return LIBEV_RET_OK;
 }
 
+static enum libev_ret specter_udp_parser_cb(struct libev_conn *cn)
+{
+	char buf[UDP_MESSAGE_SIZE];
+	struct sockaddr_in sa;
+	socklen_t len = sizeof(sa);
+	ssize_t size;
+	uint8_t *cmd;
+
+	if ((size = recvfrom(cn->w.fd, buf, sizeof(buf), 0, (struct sockaddr *)&sa, &len)) < 0) {
+		if (errno == EWOULDBLOCK)
+			return LIBEV_RET_OK;
+
+		log_e("recvfrom failed: %s", strerror(errno));
+
+		return LIBEV_RET_ERROR;
+	}
+
+	unpack_init(r, buf, size);
+	cmd = unpack(r, sizeof(*cmd));
+	if (cmd == NULL) {
+		log_e("can't unpack udp command");
+		return LIBEV_RET_ERROR;
+	}
+
+	switch (*cmd) {
+	case SPECTER_UDP_COMMAND_PING: {
+		uint8_t pong = SPECTER_UDP_RESPONSE_PONG;
+		char resp[2];
+
+		pack_init(r, resp, sizeof(resp));
+		pack(r, &pong, sizeof(pong));
+
+		if (sendto(cn->w.fd, pack_data(r), pack_len(r), 0, (struct sockaddr *)&sa, len) < 0) {
+			log_e("sendto failed: %s", strerror(errno));
+			return LIBEV_RET_ERROR;
+		}
+
+		break;
+	}
+	case SPECTER_UDP_COMMAND_PUT: {
+		struct config *config = config_get();
+		struct libev_conn *cn;
+
+		if (__searching_designator == true) {
+			__searching_designator = false;
+			__designator_addr = sa;
+
+			cn = libev_create_conn();
+			libev_timer_stop(__timer);
+
+			assert(__rsa_designator_public_key == NULL);
+			return libev_connect_to(cn, sa.sin_port, sa.sin_addr.s_addr,
+						libev_continue_init_cb,
+						config->designator_connect_timeout,
+						specter_timeout_break_all_cb);
+		}
+
+		break;
+	}
+	default:
+		log_w("unknown udp command: `%u'", *cmd);
+		return LIBEV_RET_ERROR;
+	}
+
+	return LIBEV_RET_OK;
+}
+
 static enum libev_ret libev_read_designator_pub_key_cb(struct libev_conn *cn)
 {
 	char *public_key;
 	uint32_t *key_len_p, key_len;
+
+	if (__rsa_designator_public_key != NULL)
+		// we already have public key, don't update it
+		return LIBEV_RET_CLOSE_CONN;
 
 	if (cn->rbuf.size < sizeof(*key_len_p))
 		// not fully read
@@ -841,20 +941,6 @@ static enum libev_ret libev_continue_init_cb(struct libev_conn *cn)
 	cn->write_cb = NULL;
 	libev_conn_off_timer(cn);
 	if (libev_socket_error_occurred(cn->w.fd) != 0) {
-		libev_stop();
-
-		return LIBEV_RET_ERROR;
-	}
-
-	if (libev_bind_listen_tcp_socket(config->listen_port, config->listen_addr,
-					 specter_accept_new_client_cb) != LIBEV_RET_OK) {
-		libev_stop();
-
-		return LIBEV_RET_ERROR;
-	}
-
-	if (libev_bind_listen_tcp_socket(config->listen_node_port, config->listen_node_addr,
-					 specter_accept_new_node_cb) != LIBEV_RET_OK) {
 		libev_stop();
 
 		return LIBEV_RET_ERROR;
@@ -926,10 +1012,52 @@ int specter_read_rsa_key(const char *filename, char **key, uint32_t *size)
 	return 0;
 }
 
+static enum libev_timer_ret specter_search_designator_timeout_cb(struct libev_timer *t __attribute__((unused)),
+								 void *ctx __attribute__((unused)))
+{
+	if (__rsa_designator_public_key != NULL)
+		return LIBEV_TIMER_RET_STOP;
+
+	log_w("can't find new designator, exiting ...");
+	libev_stop();
+
+	return LIBEV_TIMER_RET_STOP;
+}
+
+static int specter_search_designator(void)
+{
+	struct config *conf = config_get();
+	uint8_t command = DESIGNATOR_UDP_COMMAND_GET;
+	char req[8];
+
+	assert(__searching_designator == false);
+
+	__rsa_designator_public_key_len = 0;
+	if (__rsa_designator_public_key != NULL) {
+		free(__rsa_designator_public_key);
+		__rsa_designator_public_key = NULL;
+	}
+
+	__searching_designator = true;
+	pack_init(r, req, sizeof(req));
+	pack(r, &command, sizeof(command));
+
+	if (__timer == NULL)
+		__timer = libev_timer_create(conf->designator_connect_timeout, 0.,
+					     specter_search_designator_timeout_cb, NULL);
+
+	libev_timer_start(__timer);
+	if (libev_send_broadcast(pack_data(r), pack_len(r), conf->designator_port) != LIBEV_RET_OK)
+		return -1;
+
+	log_d("start searching for new designator ...");
+
+	return 0;
+}
+
 int specter_initialize(void)
 {
 	struct config *config = config_get();
-	struct libev_conn *cn;
 
 	if (specter_read_rsa_key(config->public_key, &__rsa_public_key, &__rsa_public_key_len) != 0 ||
 	    specter_read_rsa_key(config->private_key, &__rsa_private_key, &__rsa_private_key_len) != 0)
@@ -941,12 +1069,25 @@ int specter_initialize(void)
 		return -1;
 	}
 
-	cn = libev_create_conn();
-	if (libev_connect_to(cn, htons(config->designator_port),
-			     htonl(config->designator_addr),
-			     libev_continue_init_cb,
-			     config->designator_connect_timeout,
-			     specter_timeout_break_all_cb) != LIBEV_RET_OK)
+	if (libev_bind_listen_tcp_socket(config->listen_port, config->listen_addr,
+					 specter_accept_new_client_cb) != LIBEV_RET_OK) {
+		libev_stop();
+
+		return -1;
+	}
+
+	if (libev_bind_listen_tcp_socket(config->listen_node_port, config->listen_node_addr,
+					 specter_accept_new_node_cb) != LIBEV_RET_OK) {
+		libev_stop();
+
+		return -1;
+	}
+
+	if (libev_bind_udp_socket(config->listen_node_port, config->listen_node_addr,
+				  specter_udp_parser_cb) != LIBEV_RET_OK)
+		return -1;
+
+	if (specter_search_designator() != 0)
 		return -1;
 
 	return 0;

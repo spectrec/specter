@@ -19,10 +19,14 @@
 #define LIBEV_CONN(_w, _n) (struct libev_conn *)(((char *)_w) - offsetof(struct libev_conn, _n));
 
 static struct ev_loop *__loop;
+static int __broadcast_socket = -1;
 
 __attribute__((destructor))
 static void libev_cleanup(void)
 {
+	if (__broadcast_socket != -1)
+		close(__broadcast_socket);
+
 	ev_loop_destroy(__loop);
 }
 
@@ -273,29 +277,73 @@ struct libev_conn *libev_accept(struct libev_conn *listen_cn)
 	return cn;
 }
 
-#define LISTEN_QUEUE_SIZE 16
-enum libev_ret libev_bind_listen_tcp_socket(uint16_t port, uint32_t addr,
-					    libev_cb_t listen_parser)
+static int libev_create_broadcast_socket(void)
 {
-	int fd = socket(AF_INET, SOCK_STREAM, 0);
-	if (fd < 0) {
+	int fd, opt = 1;
+
+	if ((fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
 		log_e("can't create socket: %s", strerror(errno));
+		return -1;
+	}
+
+	if (setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &opt, sizeof(opt)) != 0) {
+		log_e("can't make socket broadcast: %s", strerror(errno));
+		close(fd);
 
 		return -1;
 	}
 
-	long reuse_addr = 1;
-	if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse_addr, sizeof(reuse_addr)) != 0) {
-		log_e("can't setsockopt: %s", strerror(errno));
-		(void)close(fd);
+	return fd;
+}
 
-		return -1;
+enum libev_ret libev_send_broadcast(const void *data, size_t len, uint16_t port)
+{
+	static struct sockaddr_in sa;
+
+	if (__broadcast_socket == -1) {
+		if ((__broadcast_socket = libev_create_broadcast_socket()) == -1) {
+			log_e("can't create broadcast socket: %s", strerror(errno));
+			return LIBEV_RET_ERROR;
+		}
+	}
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sin_family = AF_INET;
+	sa.sin_port = htons(port);
+	sa.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+
+	if (sendto(__broadcast_socket, data, len, 0, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+		log_e("sendto failed: %s", strerror(errno));
+		return LIBEV_RET_ERROR;
+	}
+
+	return LIBEV_RET_OK;
+}
+
+static void libev_new_udp_cb(EV_P_ ev_io *w, int revents)
+{
+	struct libev_conn *cn = LIBEV_CONN(w, w);
+
+	(void)loop;
+	(void)revents;
+
+	cn->read_cb(cn);
+}
+
+enum libev_ret libev_bind_udp_socket(uint16_t port, uint32_t addr,
+				     libev_cb_t listen_parser)
+{
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0) {
+		log_e("can't create socket: %s", strerror(errno));
+
+		return LIBEV_RET_ERROR;
 	}
 
 	if (libev_set_socket_nonblock(fd) != 0) {
 		(void)close(fd);
 
-		return -1;
+		return LIBEV_RET_ERROR;
 	}
 
 	struct sockaddr_in sa;
@@ -309,14 +357,61 @@ enum libev_ret libev_bind_listen_tcp_socket(uint16_t port, uint32_t addr,
 		log_e("bind error: %s", strerror(errno));
 		(void)close(fd);
 
-		return -1;
+		return LIBEV_RET_ERROR;
+	}
+
+	struct libev_conn *cn = libev_create_conn();
+	ev_io_init(&cn->w, libev_new_udp_cb, fd, EV_READ);
+	ev_io_start(__loop, &cn->w);
+	cn->read_cb = listen_parser;
+
+	return LIBEV_RET_OK;
+}
+
+#define LISTEN_QUEUE_SIZE 16
+enum libev_ret libev_bind_listen_tcp_socket(uint16_t port, uint32_t addr,
+					    libev_cb_t listen_parser)
+{
+	int fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) {
+		log_e("can't create socket: %s", strerror(errno));
+
+		return LIBEV_RET_ERROR;
+	}
+
+	long reuse_addr = 1;
+	if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse_addr, sizeof(reuse_addr)) != 0) {
+		log_e("can't setsockopt: %s", strerror(errno));
+		(void)close(fd);
+
+		return LIBEV_RET_ERROR;
+	}
+
+	if (libev_set_socket_nonblock(fd) != 0) {
+		(void)close(fd);
+
+		return LIBEV_RET_ERROR;
+	}
+
+	struct sockaddr_in sa;
+	memset(&sa, 0, sizeof(sa));
+
+	sa.sin_family = AF_INET;
+	sa.sin_port = htons(port);
+	sa.sin_addr.s_addr = htonl(addr);
+
+	if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+		log_e("bind error: %s", strerror(errno));
+		(void)close(fd);
+
+		return LIBEV_RET_ERROR;
 	}
 
 	if (listen(fd, LISTEN_QUEUE_SIZE) != 0) {
 		log_e("listen error: %s", strerror(errno));
 		(void)close(fd);
 
-		return -1;
+		return LIBEV_RET_ERROR;
 	}
 
 	struct libev_conn *cn = libev_create_conn();
@@ -324,7 +419,7 @@ enum libev_ret libev_bind_listen_tcp_socket(uint16_t port, uint32_t addr,
 	ev_io_start(__loop, &cn->w);
 	cn->accept_cb = listen_parser;
 
-	return 0;
+	return LIBEV_RET_OK;
 }
 
 static void libev_conn_delay_timer_cb(EV_P_ ev_timer *t)
@@ -489,7 +584,8 @@ void libev_timer_start(struct libev_timer *t)
 	uint32_t delay;
 	float after;
 
-	delay = (uint32_t)(t->delay * 1e6); // msecs
+	if ((delay = (uint32_t)(t->delay * 1e6)) == 0)
+		delay = 1;
 	after = t->interval + (rand() % delay) / 1e6f;
 
 	ev_timer_stop(__loop, &t->t);

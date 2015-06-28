@@ -65,11 +65,14 @@ void libev_cleanup_conn(struct libev_conn *cn);
 
 struct libev_conn *libev_accept(struct libev_conn *cn);
 void libev_send(struct libev_conn *cn, const void *data, size_t size);
+enum libev_ret libev_send_broadcast(const void *data, size_t len, uint16_t port);
 enum libev_ret libev_bind_listen_tcp_socket(uint16_t port, uint32_t addr,
 					    libev_cb_t listen_parser);
 enum libev_ret libev_connect_to(struct libev_conn *cn, uint16_t port,
 				uint32_t host, libev_cb_t cb,
 				float timeout, libev_cb_t timeout_cb);
+enum libev_ret libev_bind_udp_socket(uint16_t port, uint32_t addr,
+				     libev_cb_t listen_parser);
 
 struct libev_timer *libev_timer_create(float interval, float delay,
 				       libev_timer_cb_t cb, void *ctx);
